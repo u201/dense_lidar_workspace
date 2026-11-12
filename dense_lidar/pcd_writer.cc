@@ -7,6 +7,11 @@
 namespace dense_lidar {
 namespace {
 
+// 缓冲区超过该阈值就落盘一次，避免整帧数据常驻内存。
+constexpr size_t kFlushThreshold = 1u << 20;
+// WIDTH / POINTS 的定宽位数，uint64 最多 20 位。
+constexpr int kCountWidth = 20;
+
 // 每个字段一行：元信息 + ascii 格式化 + binary 取址。
 // 新增字段只需在这里加一条，ascii / binary 两条写出路径共用，避免两份 switch 漂移。
 struct FieldSpec {
@@ -139,79 +144,167 @@ bool ParseFields(const std::string& text, std::vector<Field>* fields, std::strin
   return true;
 }
 
-bool WritePcd(const std::string& path, const Point* points, size_t count,
-              const std::vector<Field>& fields, bool binary, std::string* error) {
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out) {
+PcdWriter::~PcdWriter() {
+  if (out_.is_open()) {
+    Close(nullptr);
+  }
+}
+
+bool PcdWriter::Open(const std::string& path, const std::vector<Field>& fields, bool binary,
+                     std::string* error) {
+  if (out_.is_open()) {
+    out_.close();
+  }
+  path_ = path;
+  fields_ = fields;
+  binary_ = binary;
+  point_count_ = 0;
+  buffer_.clear();
+  buffer_.reserve(kFlushThreshold + 256);
+
+  out_.open(path, std::ios::binary | std::ios::trunc);
+  if (!out_) {
     if (error != nullptr) {
       *error = "failed to open " + path;
     }
     return false;
   }
+  if (!WriteHeader(0)) {
+    if (error != nullptr) {
+      *error = "failed to write " + path;
+    }
+    out_.close();
+    return false;
+  }
+  return true;
+}
 
-  // 每个字段查找一次，点循环里只按下标访问，避免逐点线性查表。
+bool PcdWriter::Append(const Point* points, size_t count, std::string* error) {
+  if (!out_.is_open()) {
+    if (error != nullptr) {
+      *error = "writer is not open";
+    }
+    return false;
+  }
+  if (count == 0) {
+    return true;
+  }
+
+  // 每帧查找一次字段，点循环里只按下标访问，避免逐点线性查表。
   std::vector<const FieldSpec*> columns;
-  columns.reserve(fields.size());
-  for (Field field : fields) {
+  columns.reserve(fields_.size());
+  for (Field field : fields_) {
     columns.push_back(&SpecOf(field));
   }
 
-  out << "# .PCD v0.7 - Point Cloud Data file format\n";
-  out << "VERSION 0.7\n";
-
-  out << "FIELDS";
-  for (const FieldSpec* spec : columns) {
-    out << ' ' << spec->info.name;
-  }
-  out << "\nSIZE";
-  for (const FieldSpec* spec : columns) {
-    out << ' ' << static_cast<unsigned>(spec->info.size);
-  }
-  out << "\nTYPE";
-  for (const FieldSpec* spec : columns) {
-    out << ' ' << spec->info.type;
-  }
-  out << "\nCOUNT";
-  for (size_t i = 0; i < columns.size(); ++i) {
-    out << " 1";
-  }
-  out << "\nWIDTH " << count << "\n";
-  out << "HEIGHT 1\n";
-  out << "VIEWPOINT 0 0 0 1 0 0 0\n";
-  out << "POINTS " << count << "\n";
-  out << "DATA " << (binary ? "binary" : "ascii") << "\n";
-
-  constexpr size_t kFlushThreshold = 1u << 20;
-  std::string buffer;
-  buffer.reserve(kFlushThreshold + 256);
-
   for (size_t i = 0; i < count; ++i) {
     for (size_t j = 0; j < columns.size(); ++j) {
-      if (!binary && j != 0) {
-        buffer.push_back(' ');
+      if (!binary_ && j != 0) {
+        buffer_.push_back(' ');
       }
-      AppendField(&buffer, points[i], *columns[j], binary);
+      AppendField(&buffer_, points[i], *columns[j], binary_);
     }
-    if (!binary) {
-      buffer.push_back('\n');
+    if (!binary_) {
+      buffer_.push_back('\n');
     }
-    if (buffer.size() >= kFlushThreshold) {
-      out.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-      buffer.clear();
+    if (buffer_.size() >= kFlushThreshold) {
+      out_.write(buffer_.data(), static_cast<std::streamsize>(buffer_.size()));
+      buffer_.clear();
+      if (!out_) {
+        if (error != nullptr) {
+          *error = "failed to write " + path_;
+        }
+        return false;
+      }
     }
+  }
+  point_count_ += count;
+  return true;
+}
+
+bool PcdWriter::Close(std::string* error) {
+  if (!out_.is_open()) {
+    if (error != nullptr) {
+      *error = "writer is not open";
+    }
+    return false;
   }
 
-  if (!buffer.empty()) {
-    out.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+  if (!buffer_.empty()) {
+    out_.write(buffer_.data(), static_cast<std::streamsize>(buffer_.size()));
+    buffer_.clear();
   }
-  out.flush();
-  if (!out) {
+  out_.flush();
+  if (!out_) {
     if (error != nullptr) {
-      *error = "failed to write " + path;
+      *error = "failed to write " + path_;
+    }
+    out_.close();
+    return false;
+  }
+
+  // 头部占位与回填使用同一套定宽格式，重写后长度不变，后面的数据无需搬动。
+  out_.seekp(0);
+  if (!WriteHeader(point_count_)) {
+    if (error != nullptr) {
+      *error = "failed to write " + path_;
+    }
+    out_.close();
+    return false;
+  }
+  out_.flush();
+  out_.close();
+  if (!out_) {
+    if (error != nullptr) {
+      *error = "failed to write " + path_;
     }
     return false;
   }
   return true;
+}
+
+bool PcdWriter::WriteHeader(uint64_t count) {
+  char count_text[kCountWidth + 1];
+  std::snprintf(count_text, sizeof(count_text), "%0*llu", kCountWidth,
+                static_cast<unsigned long long>(count));
+
+  out_ << "# .PCD v0.7 - Point Cloud Data file format\n";
+  out_ << "VERSION 0.7\n";
+
+  out_ << "FIELDS";
+  for (Field field : fields_) {
+    out_ << ' ' << SpecOf(field).info.name;
+  }
+  out_ << "\nSIZE";
+  for (Field field : fields_) {
+    out_ << ' ' << static_cast<unsigned>(SpecOf(field).info.size);
+  }
+  out_ << "\nTYPE";
+  for (Field field : fields_) {
+    out_ << ' ' << SpecOf(field).info.type;
+  }
+  out_ << "\nCOUNT";
+  for (size_t i = 0; i < fields_.size(); ++i) {
+    out_ << " 1";
+  }
+  out_ << "\nWIDTH " << count_text << "\n";
+  out_ << "HEIGHT 1\n";
+  out_ << "VIEWPOINT 0 0 0 1 0 0 0\n";
+  out_ << "POINTS " << count_text << "\n";
+  out_ << "DATA " << (binary_ ? "binary" : "ascii") << "\n";
+  return static_cast<bool>(out_);
+}
+
+bool WritePcd(const std::string& path, const Point* points, size_t count,
+              const std::vector<Field>& fields, bool binary, std::string* error) {
+  PcdWriter writer;
+  if (!writer.Open(path, fields, binary, error)) {
+    return false;
+  }
+  if (!writer.Append(points, count, error)) {
+    return false;
+  }
+  return writer.Close(error);
 }
 
 }  // namespace dense_lidar
