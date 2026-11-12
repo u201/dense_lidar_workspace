@@ -44,7 +44,8 @@ struct FieldInfo {
   char type;  // 'F' float, 'U' unsigned integer
 };
 
-const std::vector<FieldInfo>& AllFields();
+// 返回字段的 PCD 元信息；枚举值全覆盖，正常调用不会失败。
+const FieldInfo& FindField(Field field);
 
 // 解析逗号分隔的字段列表，忽略空白并去重；遇到未知字段返回 false。
 bool ParseFields(const std::string& text, std::vector<Field>* fields, std::string* error);

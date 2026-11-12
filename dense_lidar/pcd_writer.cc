@@ -7,88 +7,80 @@
 namespace dense_lidar {
 namespace {
 
-const FieldInfo& InfoOf(Field field) {
-  for (const FieldInfo& info : AllFields()) {
-    if (info.field == field) {
-      return info;
+// 每个字段一行：元信息 + ascii 格式化 + binary 取址。
+// 新增字段只需在这里加一条，ascii / binary 两条写出路径共用，避免两份 switch 漂移。
+struct FieldSpec {
+  FieldInfo info;
+  void (*FormatAscii)(const Point&, char* buf, size_t len);
+  const void* (*Raw)(const Point&);
+};
+
+const std::vector<FieldSpec>& FieldTable() {
+  static const std::vector<FieldSpec> kTable = {
+      {{Field::kRing, "ring", 2, 'U'},
+       [](const Point& p, char* buf, size_t len) {
+         std::snprintf(buf, len, "%u", static_cast<unsigned>(p.ring));
+       },
+       [](const Point& p) -> const void* { return &p.ring; }},
+      {{Field::kX, "x", 4, 'F'},
+       [](const Point& p, char* buf, size_t len) { std::snprintf(buf, len, "%.9g", p.x); },
+       [](const Point& p) -> const void* { return &p.x; }},
+      {{Field::kY, "y", 4, 'F'},
+       [](const Point& p, char* buf, size_t len) { std::snprintf(buf, len, "%.9g", p.y); },
+       [](const Point& p) -> const void* { return &p.y; }},
+      {{Field::kZ, "z", 4, 'F'},
+       [](const Point& p, char* buf, size_t len) { std::snprintf(buf, len, "%.9g", p.z); },
+       [](const Point& p) -> const void* { return &p.z; }},
+      {{Field::kIntensity, "intensity", 1, 'U'},
+       [](const Point& p, char* buf, size_t len) {
+         std::snprintf(buf, len, "%u", static_cast<unsigned>(p.intensity));
+       },
+       [](const Point& p) -> const void* { return &p.intensity; }},
+      {{Field::kTimestamp, "timestamp", 8, 'F'},
+       // 时间戳通常是 1e9 量级的秒数，用 17 位有效数字避免精度损失。
+       [](const Point& p, char* buf, size_t len) { std::snprintf(buf, len, "%.17g", p.timestamp); },
+       [](const Point& p) -> const void* { return &p.timestamp; }},
+      {{Field::kDistance, "distance", 4, 'F'},
+       [](const Point& p, char* buf, size_t len) { std::snprintf(buf, len, "%.9g", p.distance); },
+       [](const Point& p) -> const void* { return &p.distance; }},
+      {{Field::kConfidence, "confidence", 1, 'U'},
+       [](const Point& p, char* buf, size_t len) {
+         std::snprintf(buf, len, "%u", static_cast<unsigned>(p.confidence));
+       },
+       [](const Point& p) -> const void* { return &p.confidence; }},
+      {{Field::kAzimuthCalib, "azimuthCalib", 4, 'F'},
+       [](const Point& p, char* buf, size_t len) {
+         std::snprintf(buf, len, "%.9g", p.azimuthCalib);
+       },
+       [](const Point& p) -> const void* { return &p.azimuthCalib; }},
+      {{Field::kElevationCalib, "elevationCalib", 4, 'F'},
+       [](const Point& p, char* buf, size_t len) {
+         std::snprintf(buf, len, "%.9g", p.elevationCalib);
+       },
+       [](const Point& p) -> const void* { return &p.elevationCalib; }},
+  };
+  return kTable;
+}
+
+const FieldSpec& SpecOf(Field field) {
+  const std::vector<FieldSpec>& table = FieldTable();
+  for (const FieldSpec& spec : table) {
+    if (spec.info.field == field) {
+      return spec;
     }
   }
-  // AllFields() 覆盖所有枚举值，这里不会到达。
-  static const FieldInfo kUnknown{Field::kX, "x", 4, 'F'};
-  return kUnknown;
+  // Field 枚举值都被上表覆盖，这里不会到达。
+  return table.front();
 }
 
-void AppendAscii(std::string* out, const Point& point, Field field) {
+void AppendField(std::string* out, const Point& point, const FieldSpec& spec, bool binary) {
+  if (binary) {
+    out->append(static_cast<const char*>(spec.Raw(point)), spec.info.size);
+    return;
+  }
   char buf[64];
-  switch (field) {
-    case Field::kRing:
-      std::snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(point.ring));
-      break;
-    case Field::kX:
-      std::snprintf(buf, sizeof(buf), "%.9g", point.x);
-      break;
-    case Field::kY:
-      std::snprintf(buf, sizeof(buf), "%.9g", point.y);
-      break;
-    case Field::kZ:
-      std::snprintf(buf, sizeof(buf), "%.9g", point.z);
-      break;
-    case Field::kIntensity:
-      std::snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(point.intensity));
-      break;
-    case Field::kTimestamp:
-      // 时间戳通常是 1e9 量级的秒数，用 17 位有效数字避免精度损失。
-      std::snprintf(buf, sizeof(buf), "%.17g", point.timestamp);
-      break;
-    case Field::kDistance:
-      std::snprintf(buf, sizeof(buf), "%.9g", point.distance);
-      break;
-    case Field::kConfidence:
-      std::snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(point.confidence));
-      break;
-    case Field::kAzimuthCalib:
-      std::snprintf(buf, sizeof(buf), "%.9g", point.azimuthCalib);
-      break;
-    case Field::kElevationCalib:
-      std::snprintf(buf, sizeof(buf), "%.9g", point.elevationCalib);
-      break;
-  }
+  spec.FormatAscii(point, buf, sizeof(buf));
   out->append(buf);
-}
-
-void AppendBinary(std::string* out, const Point& point, Field field) {
-  switch (field) {
-    case Field::kRing:
-      out->append(reinterpret_cast<const char*>(&point.ring), sizeof(point.ring));
-      break;
-    case Field::kX:
-      out->append(reinterpret_cast<const char*>(&point.x), sizeof(point.x));
-      break;
-    case Field::kY:
-      out->append(reinterpret_cast<const char*>(&point.y), sizeof(point.y));
-      break;
-    case Field::kZ:
-      out->append(reinterpret_cast<const char*>(&point.z), sizeof(point.z));
-      break;
-    case Field::kIntensity:
-      out->append(reinterpret_cast<const char*>(&point.intensity), sizeof(point.intensity));
-      break;
-    case Field::kTimestamp:
-      out->append(reinterpret_cast<const char*>(&point.timestamp), sizeof(point.timestamp));
-      break;
-    case Field::kDistance:
-      out->append(reinterpret_cast<const char*>(&point.distance), sizeof(point.distance));
-      break;
-    case Field::kConfidence:
-      out->append(reinterpret_cast<const char*>(&point.confidence), sizeof(point.confidence));
-      break;
-    case Field::kAzimuthCalib:
-      out->append(reinterpret_cast<const char*>(&point.azimuthCalib), sizeof(point.azimuthCalib));
-      break;
-    case Field::kElevationCalib:
-      out->append(reinterpret_cast<const char*>(&point.elevationCalib), sizeof(point.elevationCalib));
-      break;
-  }
 }
 
 std::string Trim(const std::string& text) {
@@ -103,21 +95,7 @@ std::string Trim(const std::string& text) {
 
 }  // namespace
 
-const std::vector<FieldInfo>& AllFields() {
-  static const std::vector<FieldInfo> kFields = {
-      {Field::kRing, "ring", 2, 'U'},
-      {Field::kX, "x", 4, 'F'},
-      {Field::kY, "y", 4, 'F'},
-      {Field::kZ, "z", 4, 'F'},
-      {Field::kIntensity, "intensity", 1, 'U'},
-      {Field::kTimestamp, "timestamp", 8, 'F'},
-      {Field::kDistance, "distance", 4, 'F'},
-      {Field::kConfidence, "confidence", 1, 'U'},
-      {Field::kAzimuthCalib, "azimuthCalib", 4, 'F'},
-      {Field::kElevationCalib, "elevationCalib", 4, 'F'},
-  };
-  return kFields;
-}
+const FieldInfo& FindField(Field field) { return SpecOf(field).info; }
 
 bool ParseFields(const std::string& text, std::vector<Field>* fields, std::string* error) {
   fields->clear();
@@ -127,19 +105,19 @@ bool ParseFields(const std::string& text, std::vector<Field>* fields, std::strin
     std::string name = Trim(text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
     if (!name.empty()) {
       bool found = false;
-      for (const FieldInfo& info : AllFields()) {
-        if (name == info.name) {
+      for (const FieldSpec& spec : FieldTable()) {
+        if (name == spec.info.name) {
           found = true;
-          if (std::find(fields->begin(), fields->end(), info.field) == fields->end()) {
-            fields->push_back(info.field);
+          if (std::find(fields->begin(), fields->end(), spec.info.field) == fields->end()) {
+            fields->push_back(spec.info.field);
           }
           break;
         }
       }
       if (!found) {
         std::string supported;
-        for (const FieldInfo& info : AllFields()) {
-          supported += supported.empty() ? info.name : std::string(",") + info.name;
+        for (const FieldSpec& spec : FieldTable()) {
+          supported += supported.empty() ? spec.info.name : std::string(",") + spec.info.name;
         }
         if (error != nullptr) {
           *error = "unknown field '" + name + "', supported fields: " + supported;
@@ -171,23 +149,30 @@ bool WritePcd(const std::string& path, const Point* points, size_t count,
     return false;
   }
 
+  // 每个字段查找一次，点循环里只按下标访问，避免逐点线性查表。
+  std::vector<const FieldSpec*> columns;
+  columns.reserve(fields.size());
+  for (Field field : fields) {
+    columns.push_back(&SpecOf(field));
+  }
+
   out << "# .PCD v0.7 - Point Cloud Data file format\n";
   out << "VERSION 0.7\n";
 
   out << "FIELDS";
-  for (Field field : fields) {
-    out << ' ' << InfoOf(field).name;
+  for (const FieldSpec* spec : columns) {
+    out << ' ' << spec->info.name;
   }
   out << "\nSIZE";
-  for (Field field : fields) {
-    out << ' ' << static_cast<unsigned>(InfoOf(field).size);
+  for (const FieldSpec* spec : columns) {
+    out << ' ' << static_cast<unsigned>(spec->info.size);
   }
   out << "\nTYPE";
-  for (Field field : fields) {
-    out << ' ' << InfoOf(field).type;
+  for (const FieldSpec* spec : columns) {
+    out << ' ' << spec->info.type;
   }
   out << "\nCOUNT";
-  for (size_t i = 0; i < fields.size(); ++i) {
+  for (size_t i = 0; i < columns.size(); ++i) {
     out << " 1";
   }
   out << "\nWIDTH " << count << "\n";
@@ -200,29 +185,19 @@ bool WritePcd(const std::string& path, const Point* points, size_t count,
   std::string buffer;
   buffer.reserve(kFlushThreshold + 256);
 
-  if (binary) {
-    for (size_t i = 0; i < count; ++i) {
-      for (Field field : fields) {
-        AppendBinary(&buffer, points[i], field);
+  for (size_t i = 0; i < count; ++i) {
+    for (size_t j = 0; j < columns.size(); ++j) {
+      if (!binary && j != 0) {
+        buffer.push_back(' ');
       }
-      if (buffer.size() >= kFlushThreshold) {
-        out.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-        buffer.clear();
-      }
+      AppendField(&buffer, points[i], *columns[j], binary);
     }
-  } else {
-    for (size_t i = 0; i < count; ++i) {
-      for (size_t j = 0; j < fields.size(); ++j) {
-        if (j != 0) {
-          buffer.push_back(' ');
-        }
-        AppendAscii(&buffer, points[i], fields[j]);
-      }
+    if (!binary) {
       buffer.push_back('\n');
-      if (buffer.size() >= kFlushThreshold) {
-        out.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-        buffer.clear();
-      }
+    }
+    if (buffer.size() >= kFlushThreshold) {
+      out.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+      buffer.clear();
     }
   }
 
