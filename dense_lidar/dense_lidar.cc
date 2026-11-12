@@ -31,6 +31,7 @@ struct Options {
   std::string file_prefix;
   std::vector<Field> fields;
   bool binary = false;
+  bool merge = false;
   bool play_synchronization = true;
 };
 
@@ -49,6 +50,8 @@ ParseStatus ParseOptions(int argc, char* argv[], Options* options) {
        "azimuthCalib,elevationCalib",
        cxxopts::value<std::string>()->default_value("x,y,z"))
       ("b,binary", "Write binary PCD instead of ascii", cxxopts::value<bool>()->default_value("false"))
+      ("m,merge", "Merge all frames into one PCD file instead of one file per frame",
+       cxxopts::value<bool>()->default_value("false"))
       ("no-sync", "Parse as fast as possible instead of following pcap timestamps",
        cxxopts::value<bool>()->default_value("false"))
       ("h,help", "Print help message");
@@ -101,6 +104,7 @@ ParseStatus ParseOptions(int argc, char* argv[], Options* options) {
     options->has_firetimes = true;
   }
   options->binary = result["binary"].as<bool>();
+  options->merge = result["merge"].as<bool>();
   options->play_synchronization = !result["no-sync"].as<bool>();
   return ParseStatus::kOk;
 }
@@ -112,7 +116,8 @@ class FrameSink {
       : out_folder_(std::move(out_folder)),
         file_prefix_(std::move(file_prefix)),
         fields_(std::move(fields)),
-        binary_(binary) {}
+        binary_(binary),
+        merged_path_((std::filesystem::path(out_folder_) / file_prefix_).string() + ".pcd") {}
 
   void OnFrame(const Frame& frame) {
     last_frame_us_.store(GetMicroTickCountU64());
@@ -139,6 +144,50 @@ class FrameSink {
                 path.string().c_str());
   }
 
+  // 多帧合并：所有帧追加到同一个 pcd，首帧时惰性打开，RunToEnd 里 Close 回填总点数。
+  void OnFrameMerged(const Frame& frame) {
+    last_frame_us_.store(GetMicroTickCountU64());
+    if (frame.points_num == 0) {
+      return;
+    }
+
+    std::string error;
+    if (!merged_open_) {
+      if (!merged_.Open(merged_path_, fields_, binary_, &error)) {
+        std::fprintf(stderr, "[dense_lidar] open %s failed: %s\n", merged_path_.c_str(),
+                     error.c_str());
+        return;
+      }
+      merged_open_ = true;
+    }
+    if (!merged_.Append(frame.points, frame.points_num, &error)) {
+      std::fprintf(stderr, "[dense_lidar] frame %d append failed: %s\n", frame.frame_index,
+                   error.c_str());
+      return;
+    }
+
+    frame_count_.fetch_add(1);
+    point_count_.fetch_add(frame.points_num);
+    std::printf("[dense_lidar] frame %d: %u points -> %s\n", frame.frame_index, frame.points_num,
+                merged_path_.c_str());
+  }
+
+  // 合并模式下收尾：落盘并回填头部点数。没收到任何帧时不会创建文件。
+  void Close() {
+    if (!merged_open_) {
+      return;
+    }
+    std::string error;
+    if (!merged_.Close(&error)) {
+      std::fprintf(stderr, "[dense_lidar] finalize %s failed: %s\n", merged_path_.c_str(),
+                   error.c_str());
+      return;
+    }
+    merged_open_ = false;
+    std::printf("[dense_lidar] merged %llu points -> %s\n",
+                static_cast<unsigned long long>(point_count()), merged_path_.c_str());
+  }
+
   uint64_t last_frame_us() const { return last_frame_us_.load(); }
   uint64_t frame_count() const { return frame_count_.load(); }
   uint64_t point_count() const { return point_count_.load(); }
@@ -148,6 +197,10 @@ class FrameSink {
   const std::string file_prefix_;
   const std::vector<Field> fields_;
   const bool binary_;
+  const std::string merged_path_;
+
+  dense_lidar::PcdWriter merged_;
+  bool merged_open_ = false;
 
   // 回调在 SDK 线程里执行，停止线程轮询读取，因此用原子量。
   std::atomic<uint64_t> last_frame_us_{0};
@@ -184,7 +237,11 @@ class Converter {
       std::cerr << "SDK init failed." << std::endl;
       return false;
     }
-    sdk_.RegRecvCallback([this](const Frame& frame) { sink_.OnFrame(frame); });
+    if (options_.merge) {
+      sdk_.RegRecvCallback([this](const Frame& frame) { sink_.OnFrameMerged(frame); });
+    } else {
+      sdk_.RegRecvCallback([this](const Frame& frame) { sink_.OnFrame(frame); });
+    }
     sdk_.Start();
     if (sdk_.lidar_ptr_->GetInitFinish(hesai::lidar::FailInit)) {
       std::cerr << "SDK init failed, check pcap/correction path." << std::endl;
@@ -201,6 +258,8 @@ class Converter {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     sdk_.Stop();
+    // SDK 线程已退出，合并文件在这里回填头部点数。
+    sink_.Close();
 
     std::printf("[dense_lidar] done: %llu frames, %llu points\n",
                 static_cast<unsigned long long>(sink_.frame_count()),
@@ -215,6 +274,8 @@ class Converter {
       std::printf("[dense_lidar] firetimes: %s\n", options_.firetimes_path.string().c_str());
     }
     std::printf("[dense_lidar] output folder: %s\n", options_.out_folder.c_str());
+    std::printf("[dense_lidar] output mode: %s\n",
+                options_.merge ? "merged (one file for all frames)" : "one file per frame");
     std::printf("[dense_lidar] data format: %s\n", options_.binary ? "binary" : "ascii");
     std::printf("[dense_lidar] fields:");
     for (Field field : options_.fields) {
