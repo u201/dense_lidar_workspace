@@ -32,7 +32,7 @@ struct Options {
   std::vector<Field> fields;
   bool binary = false;
   bool merge = false;
-  bool play_synchronization = true;
+  bool play_synchronization = false;
 };
 
 enum class ParseStatus { kOk, kExit, kError };
@@ -52,7 +52,7 @@ ParseStatus ParseOptions(int argc, char* argv[], Options* options) {
       ("b,binary", "Write binary PCD instead of ascii", cxxopts::value<bool>()->default_value("false"))
       ("m,merge", "Merge all frames into one PCD file instead of one file per frame",
        cxxopts::value<bool>()->default_value("false"))
-      ("no-sync", "Parse as fast as possible instead of following pcap timestamps",
+      ("sync", "Follow pcap timestamps; omit to parse as fast as possible",
        cxxopts::value<bool>()->default_value("false"))
       ("h,help", "Print help message");
 
@@ -105,7 +105,7 @@ ParseStatus ParseOptions(int argc, char* argv[], Options* options) {
   }
   options->binary = result["binary"].as<bool>();
   options->merge = result["merge"].as<bool>();
-  options->play_synchronization = !result["no-sync"].as<bool>();
+  options->play_synchronization = result["sync"].as<bool>();
   return ParseStatus::kOk;
 }
 
