@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 
 namespace dense_lidar {
@@ -18,15 +19,18 @@ struct FieldSpec {
   FieldInfo info;
   void (*FormatAscii)(const Point&, char* buf, size_t len);
   const void* (*Raw)(const Point&);
+  // binary 写出时的无符号加法偏移，仅用于把 0 基存储的字段转成 1 基对外。
+  uint16_t bias = 0;
 };
 
 const std::vector<FieldSpec>& FieldTable() {
   static const std::vector<FieldSpec> kTable = {
       {{Field::kRing, "ring", 2, 'U'},
+       // 解析结果是 0 基（0-15），对外统一按 1 基输出（1-16）。
        [](const Point& p, char* buf, size_t len) {
-         std::snprintf(buf, len, "%u", static_cast<unsigned>(p.ring));
+         std::snprintf(buf, len, "%u", static_cast<unsigned>(p.ring) + 1u);
        },
-       [](const Point& p) -> const void* { return &p.ring; }},
+       [](const Point& p) -> const void* { return &p.ring; }, 1},
       {{Field::kX, "x", 4, 'F'},
        [](const Point& p, char* buf, size_t len) { std::snprintf(buf, len, "%.9g", p.x); },
        [](const Point& p) -> const void* { return &p.x; }},
@@ -80,7 +84,16 @@ const FieldSpec& SpecOf(Field field) {
 
 void AppendField(std::string* out, const Point& point, const FieldSpec& spec, bool binary) {
   if (binary) {
-    out->append(static_cast<const char*>(spec.Raw(point)), spec.info.size);
+    const void* raw = spec.Raw(point);
+    if (spec.bias == 0) {
+      out->append(static_cast<const char*>(raw), spec.info.size);
+      return;
+    }
+    // 带偏移的字段目前只有 ring：2 字节无符号，先读出再加偏移。
+    uint16_t value = 0;
+    std::memcpy(&value, raw, sizeof(value));
+    value = static_cast<uint16_t>(value + spec.bias);
+    out->append(reinterpret_cast<const char*>(&value), sizeof(value));
     return;
   }
   char buf[64];
