@@ -33,6 +33,15 @@ struct Options {
   bool binary = false;
   bool merge = true;
   bool play_synchronization = false;
+
+  // 转台参数：duration 为转满 360° 所需时间，0 表示不旋转。
+  int first_frame = 0;
+  double duration = 0.0;
+  double hz = 10.0;
+  double alpha1 = 0.0;
+  double alpha2 = 0.0;
+  double arm = 0.0;
+  bool ccw = false;
 };
 
 enum class ParseStatus { kOk, kExit, kError };
@@ -53,6 +62,16 @@ ParseStatus ParseOptions(int argc, char* argv[], Options* options) {
       ("per-frame", "Write one PCD per frame instead of merging all frames into one file",
        cxxopts::value<bool>()->default_value("false"))
       ("sync", "Follow pcap timestamps; omit to parse as fast as possible",
+       cxxopts::value<bool>()->default_value("false"))
+      ("first", "First frame index to process", cxxopts::value<int>()->default_value("0"))
+      ("d,duration",
+       "Turntable rotation time for 360 degrees in seconds; 0 disables rotation",
+       cxxopts::value<double>()->default_value("0"))
+      ("hz", "Lidar frame rate in Hz", cxxopts::value<double>()->default_value("10"))
+      ("a1", "Alpha1 calibration angle in degrees", cxxopts::value<double>()->default_value("0"))
+      ("a2", "Alpha2 calibration angle in degrees", cxxopts::value<double>()->default_value("0"))
+      ("r,arm", "Arm length in meters", cxxopts::value<double>()->default_value("0"))
+      ("ccw", "Turntable rotates counter-clockwise seen from above (default: clockwise)",
        cxxopts::value<bool>()->default_value("false"))
       ("h,help", "Print help message");
 
@@ -106,6 +125,13 @@ ParseStatus ParseOptions(int argc, char* argv[], Options* options) {
   options->binary = result["binary"].as<bool>();
   options->merge = !result["per-frame"].as<bool>();
   options->play_synchronization = result["sync"].as<bool>();
+  options->first_frame = result["first"].as<int>();
+  options->duration = result["duration"].as<double>();
+  options->hz = result["hz"].as<double>();
+  options->alpha1 = result["a1"].as<double>();
+  options->alpha2 = result["a2"].as<double>();
+  options->arm = result["arm"].as<double>();
+  options->ccw = result["ccw"].as<bool>();
   return ParseStatus::kOk;
 }
 
@@ -287,6 +313,16 @@ class Converter {
       std::printf(" %s", dense_lidar::FindField(field).name);
     }
     std::printf("\n");
+    std::printf("[dense_lidar] first frame: %d\n", options_.first_frame);
+    if (options_.duration > 0.0) {
+      std::printf(
+          "[dense_lidar] turntable: %.3f s / 360 deg, %.3f Hz, arm %.4f m, alpha1 %.4f deg, "
+          "alpha2 %.4f deg, %s\n",
+          options_.duration, options_.hz, options_.arm, options_.alpha1, options_.alpha2,
+          options_.ccw ? "counter-clockwise" : "clockwise");
+    } else {
+      std::printf("[dense_lidar] turntable: disabled (duration is 0)\n");
+    }
   }
 
   const Options options_;
