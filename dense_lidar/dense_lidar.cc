@@ -168,8 +168,9 @@ class FrameSink {
 
     frame_count_.fetch_add(1);
     point_count_.fetch_add(frame.points_num);
-    std::printf("[dense_lidar] frame %d: %u points -> %s\n", frame.frame_index, frame.points_num,
-                merged_path_.c_str());
+    if (frame.frame_index % 100 == 0) {
+      std::printf("[dense_lidar] (print every 100 frames) frame %d: %u points\n", frame.frame_index, frame.points_num);
+    }
   }
 
   // 合并模式下收尾：落盘并回填头部点数。没收到任何帧时不会创建文件。
