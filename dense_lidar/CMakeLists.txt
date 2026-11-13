@@ -22,6 +22,7 @@ add_executable(dense_lidar
 
 target_include_directories(dense_lidar PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../cxxopts/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../eigen3
 )
 
 target_link_libraries(dense_lidar PRIVATE

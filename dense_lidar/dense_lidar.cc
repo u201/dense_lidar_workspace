@@ -14,12 +14,32 @@
 
 #include "hesai_lidar_sdk.hpp"
 #include "pcd_writer.h"
+#include "transform.h"
 
 namespace {
 
 using dense_lidar::Field;
 using dense_lidar::Point;
 using Frame = hesai::lidar::LidarDecodedFrame<Point>;
+
+// 转台参数：每帧转过的角度 = 360 / (duration * hz)。
+struct Turntable {
+  int first_frame = 0;
+  double duration = 0.0;  // 转满 360° 的秒数，0 表示不旋转
+  double hz = 10.0;
+  float alpha1 = 0.0f;  // 度
+  float alpha2 = 0.0f;  // 度
+  float arm = 0.0f;     // 米
+  bool ccw = false;     // false 为俯视顺时针
+
+  bool enabled() const { return duration > 0.0; }
+
+  // 该帧转台累计转过的角度（度），顺时针为正。
+  double angle_degrees(int frame_index) const {
+    const double sign = ccw ? -1.0 : 1.0;
+    return sign * static_cast<double>(frame_index - first_frame) * 360.0 / (duration * hz);
+  }
+};
 
 // 命令行解析后的完整运行配置，后续各阶段只读。
 struct Options {
@@ -33,15 +53,7 @@ struct Options {
   bool binary = false;
   bool merge = true;
   bool play_synchronization = false;
-
-  // 转台参数：duration 为转满 360° 所需时间，0 表示不旋转。
-  int first_frame = 0;
-  double duration = 0.0;
-  double hz = 10.0;
-  double alpha1 = 0.0;
-  double alpha2 = 0.0;
-  double arm = 0.0;
-  bool ccw = false;
+  Turntable turntable;
 };
 
 enum class ParseStatus { kOk, kExit, kError };
@@ -125,29 +137,57 @@ ParseStatus ParseOptions(int argc, char* argv[], Options* options) {
   options->binary = result["binary"].as<bool>();
   options->merge = !result["per-frame"].as<bool>();
   options->play_synchronization = result["sync"].as<bool>();
-  options->first_frame = result["first"].as<int>();
-  options->duration = result["duration"].as<double>();
-  options->hz = result["hz"].as<double>();
-  options->alpha1 = result["a1"].as<double>();
-  options->alpha2 = result["a2"].as<double>();
-  options->arm = result["arm"].as<double>();
-  options->ccw = result["ccw"].as<bool>();
+  options->turntable.first_frame = result["first"].as<int>();
+  options->turntable.duration = result["duration"].as<double>();
+  options->turntable.hz = result["hz"].as<double>();
+  options->turntable.alpha1 = static_cast<float>(result["a1"].as<double>());
+  options->turntable.alpha2 = static_cast<float>(result["a2"].as<double>());
+  options->turntable.arm = static_cast<float>(result["arm"].as<double>());
+  options->turntable.ccw = result["ccw"].as<bool>();
+  if (options->turntable.enabled() && options->turntable.hz <= 0.0) {
+    std::cerr << "Invalid --hz: must be positive when --duration is set." << std::endl;
+    return ParseStatus::kError;
+  }
   return ParseStatus::kOk;
 }
 
 // 逐帧写出 PCD。写出参数在构造时固化，不再依赖文件作用域全局变量。
 class FrameSink {
  public:
-  FrameSink(std::string out_folder, std::string file_prefix, std::vector<Field> fields, bool binary)
+  FrameSink(std::string out_folder, std::string file_prefix, std::vector<Field> fields, bool binary,
+            Turntable turntable)
       : out_folder_(std::move(out_folder)),
         file_prefix_(std::move(file_prefix)),
         fields_(std::move(fields)),
         binary_(binary),
+        turntable_(turntable),
         merged_path_((std::filesystem::path(out_folder_) / file_prefix_).string() + ".pcd") {}
+
+  // 开启转台时先把点变换到转台坐标系，返回要写出的点数据；否则直接返回原始点。
+  const Point* PreparePoints(const Frame& frame) {
+    if (!turntable_.enabled()) {
+      return frame.points;
+    }
+    const float angle_deg = static_cast<float>(turntable_.angle_degrees(frame.frame_index));
+    const Eigen::Affine3f transform =
+        makeFrameTransform(turntable_.arm, deg2rad(turntable_.alpha1),
+                           deg2rad(turntable_.alpha2), deg2rad(angle_deg));
+    transformed_.resize(frame.points_num);
+    for (uint32_t i = 0; i < frame.points_num; ++i) {
+      const Point& src = frame.points[i];
+      const Eigen::Vector3f p = transform * Eigen::Vector3f(src.x, src.y, src.z);
+      Point& dst = transformed_[i];
+      dst = src;
+      dst.x = p.x();
+      dst.y = p.y();
+      dst.z = p.z();
+    }
+    return transformed_.data();
+  }
 
   void OnFrame(const Frame& frame) {
     last_frame_us_.store(GetMicroTickCountU64());
-    if (frame.points_num == 0) {
+    if (frame.frame_index < turntable_.first_frame || frame.points_num == 0) {
       return;
     }
 
@@ -156,8 +196,9 @@ class FrameSink {
                   frame.frame_index, frame.frame_start_timestamp);
     std::filesystem::path path = std::filesystem::path(out_folder_) / file_name;
 
+    const Point* points = PreparePoints(frame);
     std::string error;
-    if (!dense_lidar::WritePcd(path.string(), frame.points, frame.points_num, fields_, binary_,
+    if (!dense_lidar::WritePcd(path.string(), points, frame.points_num, fields_, binary_,
                                &error)) {
       std::fprintf(stderr, "[dense_lidar] frame %d write failed: %s\n", frame.frame_index,
                    error.c_str());
@@ -173,7 +214,7 @@ class FrameSink {
   // 多帧合并：所有帧追加到同一个 pcd，首帧时惰性打开，RunToEnd 里 Close 回填总点数。
   void OnFrameMerged(const Frame& frame) {
     last_frame_us_.store(GetMicroTickCountU64());
-    if (frame.points_num == 0) {
+    if (frame.frame_index < turntable_.first_frame || frame.points_num == 0) {
       return;
     }
 
@@ -186,7 +227,8 @@ class FrameSink {
       }
       merged_open_ = true;
     }
-    if (!merged_.Append(frame.points, frame.points_num, &error)) {
+    const Point* points = PreparePoints(frame);
+    if (!merged_.Append(points, frame.points_num, &error)) {
       std::fprintf(stderr, "[dense_lidar] frame %d append failed: %s\n", frame.frame_index,
                    error.c_str());
       return;
@@ -225,10 +267,13 @@ class FrameSink {
   const std::string file_prefix_;
   const std::vector<Field> fields_;
   const bool binary_;
+  const Turntable turntable_;
   const std::string merged_path_;
 
   dense_lidar::PcdWriter merged_;
   bool merged_open_ = false;
+  // 转台模式下每帧变换后的点，复用同一块内存避免反复分配。
+  std::vector<Point> transformed_;
 
   // 回调在 SDK 线程里执行，停止线程轮询读取，因此用原子量。
   std::atomic<uint64_t> last_frame_us_{0};
@@ -241,7 +286,8 @@ class Converter {
  public:
   explicit Converter(Options options)
       : options_(std::move(options)),
-        sink_(options_.out_folder, options_.file_prefix, options_.fields, options_.binary) {}
+        sink_(options_.out_folder, options_.file_prefix, options_.fields, options_.binary,
+              options_.turntable) {}
 
   // 初始化失败返回 false，调用方负责退出。
   bool Init() {
@@ -313,13 +359,14 @@ class Converter {
       std::printf(" %s", dense_lidar::FindField(field).name);
     }
     std::printf("\n");
-    std::printf("[dense_lidar] first frame: %d\n", options_.first_frame);
-    if (options_.duration > 0.0) {
+    std::printf("[dense_lidar] first frame: %d\n", options_.turntable.first_frame);
+    if (options_.turntable.enabled()) {
       std::printf(
           "[dense_lidar] turntable: %.3f s / 360 deg, %.3f Hz, arm %.4f m, alpha1 %.4f deg, "
           "alpha2 %.4f deg, %s\n",
-          options_.duration, options_.hz, options_.arm, options_.alpha1, options_.alpha2,
-          options_.ccw ? "counter-clockwise" : "clockwise");
+          options_.turntable.duration, options_.turntable.hz, options_.turntable.arm,
+          options_.turntable.alpha1, options_.turntable.alpha2,
+          options_.turntable.ccw ? "counter-clockwise" : "clockwise");
     } else {
       std::printf("[dense_lidar] turntable: disabled (duration is 0)\n");
     }
