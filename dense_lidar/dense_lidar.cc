@@ -31,7 +31,7 @@ struct Options {
   std::string file_prefix;
   std::vector<Field> fields;
   bool binary = false;
-  bool merge = false;
+  bool merge = true;
   bool play_synchronization = false;
 };
 
@@ -50,7 +50,7 @@ ParseStatus ParseOptions(int argc, char* argv[], Options* options) {
        "azimuthCalib,elevationCalib",
        cxxopts::value<std::string>()->default_value("x,y,z"))
       ("b,binary", "Write binary PCD instead of ascii", cxxopts::value<bool>()->default_value("false"))
-      ("m,merge", "Merge all frames into one PCD file instead of one file per frame",
+      ("per-frame", "Write one PCD per frame instead of merging all frames into one file",
        cxxopts::value<bool>()->default_value("false"))
       ("sync", "Follow pcap timestamps; omit to parse as fast as possible",
        cxxopts::value<bool>()->default_value("false"))
@@ -104,7 +104,7 @@ ParseStatus ParseOptions(int argc, char* argv[], Options* options) {
     options->has_firetimes = true;
   }
   options->binary = result["binary"].as<bool>();
-  options->merge = result["merge"].as<bool>();
+  options->merge = !result["per-frame"].as<bool>();
   options->play_synchronization = result["sync"].as<bool>();
   return ParseStatus::kOk;
 }
@@ -191,6 +191,7 @@ class FrameSink {
   uint64_t last_frame_us() const { return last_frame_us_.load(); }
   uint64_t frame_count() const { return frame_count_.load(); }
   uint64_t point_count() const { return point_count_.load(); }
+  const std::string& merged_path() const { return merged_path_; }
 
  private:
   const std::string out_folder_;
@@ -276,6 +277,9 @@ class Converter {
     std::printf("[dense_lidar] output folder: %s\n", options_.out_folder.c_str());
     std::printf("[dense_lidar] output mode: %s\n",
                 options_.merge ? "merged (one file for all frames)" : "one file per frame");
+    if (options_.merge) {
+      std::printf("[dense_lidar] merged file: %s\n", sink_.merged_path().c_str());
+    }
     std::printf("[dense_lidar] data format: %s\n", options_.binary ? "binary" : "ascii");
     std::printf("[dense_lidar] fields:");
     for (Field field : options_.fields) {
