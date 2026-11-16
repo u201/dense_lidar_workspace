@@ -33,16 +33,22 @@ int main() {
         0.0f, 0.0f, 0.0f, 1.0f;
     Eigen::Affine3f refA2(matA2.transpose());
     Eigen::Matrix4f matVM;
-    matVM << 
-        1.0f, 0.0f, -2.449293598294706e-16f, 0.0f,
+    // matVM << 
+        // 1.0f, 0.0f, -2.449293598294706e-16f, 0.0f,
+        // 0.0f, 1.0f, 0.0f, 0.0f,
+        // 2.449293598294706e-16f, 0.0f, 1.0f, 0.0f,
+        // 0.0f, 0.0f, 0.0f, 1.0f;
+    matVM <<
+        0.500000000000000f, 0.0f, -0.866025403784439f, 0.0f,
         0.0f, 1.0f, 0.0f, 0.0f,
-        2.449293598294706e-16f, 0.0f, 1.0f, 0.0f,
+        0.866025403784439f, 0.0f, 0.50f, 0.0f,
         0.0f, 0.0f, 0.0f, 1.0f;
     Eigen::Affine3f refVM(matVM);
     float alpha1 = 0.1f;
     float alpha2 = -0.131f;
     float r = 0.0945f;
-    float angle = 360.0f;
+    // float angle = 360.0f;
+    float angle = 300.0f;
     Eigen::Affine3f T = makeT(r);
     Eigen::Affine3f A1 = makeA1(deg2rad(alpha1));
     Eigen::Affine3f A2 = makeA2(deg2rad(alpha2));
