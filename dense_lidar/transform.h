@@ -35,5 +35,5 @@ inline Eigen::Affine3f makeVM(float angle) {
 }
 
 inline Eigen::Affine3f makeFrameTransform(float r, float alpha1, float alpha2, float angle) {
-    return makeVM(angle) * makeA2(alpha2) * makeA1(alpha1) * makeT(r);
+    return makeVM(-angle) * makeA2(alpha2) * makeA1(alpha1) * makeT(r);
 }
