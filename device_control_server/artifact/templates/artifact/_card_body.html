@@ -1,0 +1,59 @@
+{# 卡片内容：首屏由 index 渲染，刷新/删除后由对应视图重渲染 #}
+{% if delete_error %}
+  <p class="banner error">{{ delete_error }}</p>
+{% endif %}
+{% if overview.error %}
+  <p class="banner error">{{ overview.error }}</p>
+{% endif %}
+{% if overview.blocked_reason == 'quota_exceeded' %}
+  <p class="banner error">Used 已达到 Quota，Recording disabled</p>
+{% elif overview.blocked_reason == 'folder_not_writable' %}
+  <p class="banner error">目录不可写，Recording disabled</p>
+{% endif %}
+
+<p class="folder">{{ overview.local_folder|default:overview.local_folder_configured|default:"（未配置目录）" }}</p>
+
+{% if overview.quota_bytes %}
+  <p>
+    Used {{ overview.used_bytes|filesizeformat }} /
+    Quota {{ overview.quota_bytes|filesizeformat }}，
+    共 {{ overview.file_count }} 个文件
+  </p>
+  {% widthratio overview.used_bytes overview.quota_bytes 100 as used_pct %}
+  <div class="quota-bar{% if overview.blocked_reason == 'quota_exceeded' %} over{% endif %}">
+    <div class="quota-used" style="width: {{ used_pct }}%"></div>
+  </div>
+{% endif %}
+
+{% if files %}
+<div class="card-files">
+  <table>
+    <thead>
+      <tr><th>Filename</th><th class="size">Size</th><th>Modified (UTC)</th><th>操作</th></tr>
+    </thead>
+    <tbody>
+      {% for f in files %}
+      <tr>
+        <td class="filename" title="{{ f.filename }}">{{ f.filename }}</td>
+        <td class="size">{{ f.size_bytes|filesizeformat }}</td>
+        <td class="mtime">{{ f.mtime|date:"Y-m-d H:i:s" }}</td>
+        <td class="ops">
+          <a class="op" href="{% url 'artifact:download' f.filename %}">下载</a>
+          <form class="inline"
+                hx-post="{% url 'artifact:delete' f.filename %}"
+                hx-confirm="确定删除 {{ f.filename }}？"
+                hx-target="#artifact-body"
+                hx-swap="innerHTML"
+                hx-disabled-elt="find button">
+            {% csrf_token %}
+            <button class="op danger">删除</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+  <p class="empty">目录为空或不可读。</p>
+{% endif %}

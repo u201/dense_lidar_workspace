@@ -1,0 +1,14 @@
+{# 卡片外壳：门户 include 它；永不整体替换，只有 #artifact-body 会被片段刷新 #}
+<section class="card" id="artifact-card">
+  <header class="card-header">
+    <h2>Artifact</h2>
+    <button class="op"
+            hx-get="{% url 'artifact:card' %}"
+            hx-target="#artifact-body"
+            hx-swap="innerHTML"
+            hx-disabled-elt="this">刷新</button>
+  </header>
+  <div id="artifact-body">
+    {% include "artifact/_card_body.html" %}
+  </div>
+</section>
