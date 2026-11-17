@@ -1,6 +1,12 @@
 """Artifact 服务。
 
-职责：读取 device_config.json 的 artifact 段、解析目录路径、扫描目录汇总用量。
+职责：读取 device_config.json 的 artifact 段、解析目录路径、
+一次扫描目录同时产出用量汇总与文件条目，供 htmx 卡片视图使用。
+
+状态判定分两层：
+- 基础状态（配置/存在/可读/可写）：O(1)，见 _resolve_state()
+- 配额状态（used_bytes/quota_exceeded）：目录已用量没有 O(1) 来源，
+  必须扫描，见 get_card()
 """
 
 import json
@@ -64,24 +70,13 @@ def resolve_local_folder(raw: Any) -> Path | None:
     return Path(os.path.normpath(str(path)))
 
 
-def scan_directory(folder: Path) -> tuple[int, int]:
-    """返回 (普通文件数, 总字节数)。跳过符号链接与子目录，不递归，不排除 dotfile。"""
-    file_count = 0
-    total = 0
-    with os.scandir(folder) as entries:
-        for entry in entries:
-            try:
-                if not entry.is_file(follow_symlinks=False):
-                    continue
-                total += entry.stat(follow_symlinks=False).st_size
-            except OSError:
-                continue
-            file_count += 1
-    return file_count, total
+def _resolve_state() -> dict[str, Any]:
+    """基础状态判定：配置、路径、可读写。不扫目录。
 
-
-def get_overview() -> dict[str, Any]:
-    """汇总目录路径、可用性、配额与已用量。"""
+    用量相关字段（used_bytes/file_count/remaining_bytes）先给默认值，
+    quota_exceeded 与 recording_enabled 由 get_card() 在扫描后补齐。
+    返回里带 resolve 后的 Path（键 folder），供扫描与将来 Recorder 检查使用。
+    """
     section, config_error = load_artifact_config()
     raw_folder = section.get('local_folder')
     quota_bytes = parse_quota_bytes(section.get('quota_bytes'))
@@ -90,11 +85,6 @@ def get_overview() -> dict[str, Any]:
     exists = folder is not None and folder.is_dir()
     readable = exists and os.access(folder, os.R_OK)
     writable = exists and os.access(folder, os.W_OK)
-
-    file_count = 0
-    used_bytes = 0
-    if readable:
-        file_count, used_bytes = scan_directory(folder)
 
     error = config_error
     if error is None and folder is None:
@@ -110,22 +100,113 @@ def get_overview() -> dict[str, Any]:
         blocked_reason = REASON_NOT_READABLE
     elif not writable:
         blocked_reason = REASON_NOT_WRITABLE
-    elif used_bytes >= quota_bytes:
-        blocked_reason = REASON_QUOTA_EXCEEDED
     else:
-        blocked_reason = None
+        blocked_reason = None  # 配额是否超，待扫描后判定
 
     return {
+        'folder': folder,
         'local_folder': str(folder) if folder is not None else None,
         'local_folder_configured': raw_folder if isinstance(raw_folder, str) else None,
         'exists': exists,
         'readable': readable,
         'writable': writable,
         'quota_bytes': quota_bytes,
-        'used_bytes': used_bytes,
-        'remaining_bytes': quota_bytes - used_bytes if quota_bytes is not None else None,
-        'file_count': file_count,
-        'recording_enabled': blocked_reason is None,
+        'used_bytes': 0,
+        'remaining_bytes': quota_bytes,
+        'file_count': 0,
         'blocked_reason': blocked_reason,
+        'recording_enabled': False,
         'error': error,
     }
+
+
+def _scan_entries(folder: Path) -> list[dict[str, Any]]:
+    """一次 scandir，产出 [{filename, size_bytes, mtime_epoch}]。
+
+    跳过符号链接与子目录，不递归，不排除 dotfile；
+    单个条目 stat 失败时跳过，不中断遍历。
+    """
+    entries: list[dict[str, Any]] = []
+    with os.scandir(folder) as it:
+        for entry in it:
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                stat = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            entries.append({
+                'filename': entry.name,
+                'size_bytes': stat.st_size,
+                'mtime_epoch': int(stat.st_mtime),
+            })
+    return entries
+
+
+def get_card() -> dict[str, Any]:
+    """htmx 卡片唯一入口：一次扫描同时产出 overview 与 files。
+
+    不变量：used_bytes == Σ files.size_bytes，file_count == len(files)，
+    两者来自同一次扫描，录制中也不会互相矛盾。
+    """
+    state = _resolve_state()
+    entries: list[dict[str, Any]] = []
+
+    # 目录不可写时仍展示列表（只读查看 + 下载），仅删除会失败
+    if state['readable']:
+        try:
+            entries = _scan_entries(state['folder'])
+        except OSError as exc:
+            state['blocked_reason'] = REASON_NOT_READABLE
+            state['error'] = f"目录不可读: {state['local_folder']} ({exc})"
+            entries = []
+        state['used_bytes'] = sum(e['size_bytes'] for e in entries)
+        state['file_count'] = len(entries)
+
+    if state['quota_bytes'] is not None:
+        state['remaining_bytes'] = state['quota_bytes'] - state['used_bytes']
+        if state['blocked_reason'] is None and state['used_bytes'] >= state['quota_bytes']:
+            state['blocked_reason'] = REASON_QUOTA_EXCEEDED
+    state['recording_enabled'] = state['blocked_reason'] is None
+
+    # mtime 降序，同 mtime 按文件名降序，保证稳定（为将来 offset 分页兜底）
+    entries.sort(key=lambda e: (e['mtime_epoch'], e['filename']), reverse=True)
+    return {'overview': state, 'files': entries}
+
+
+def resolve_file(filename: str) -> Path | None:
+    """白名单校验文件名并解析为目录内文件路径。
+
+    拒绝一切含路径成分的名字（..、/、\\、绝对路径），
+    且目标必须是目录内的普通文件（不是符号链接），否则返回 None。
+    """
+    if not filename or Path(filename).name != filename:
+        return None
+    section, config_error = load_artifact_config()
+    if config_error is not None:
+        return None
+    folder = resolve_local_folder(section.get('local_folder'))
+    if folder is None:
+        return None
+    path = folder / filename
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+    except OSError:
+        return None
+    return path
+
+
+def delete_file(filename: str) -> str | None:
+    """删除目录内文件。成功返回 None，失败返回可读错误消息。
+
+    TODO(Recorder 上线后)：当前录制目标文件禁止删除。
+    """
+    path = resolve_file(filename)
+    if path is None:
+        return '文件不存在或文件名非法'
+    try:
+        path.unlink()
+    except OSError as exc:
+        return f'删除失败: {exc}'
+    return None
