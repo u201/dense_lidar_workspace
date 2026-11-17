@@ -1,0 +1,156 @@
+/* 现场操作台样式：看得清、按得准、不误触。不做装饰性动画。 */
+
+:root {
+  --card-bg: #ffffff;
+  --page-bg: #f2f3f5;
+  --text: #1c1e21;
+  --muted: #5f6368;
+  --border: #d0d4d9;
+  --danger: #b3261e;
+  --quota: #2f6fdd;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 12px;
+  background: var(--page-bg);
+  color: var(--text);
+  font: 16px/1.5 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+
+/* 宽屏两列，窄屏（手机竖屏）单列；滚动即导航，无顶部菜单 */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+@media (max-width: 700px) {
+  .grid { grid-template-columns: 1fr; }
+}
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.card-header h2 { margin: 0; font-size: 18px; }
+
+/* 触控目标 >= 44px，戴手套也按得准 */
+.op,
+button.op {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  min-width: 44px;
+  padding: 8px 16px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
+  color: var(--text);
+  font-size: 16px;
+  text-decoration: none;
+  cursor: pointer;
+}
+/* 触屏无 hover，用 active 做反馈；键盘操作用 focus-visible 描边 */
+.op:active { background: #e4e6e9; }
+.op:focus-visible { outline: 2px solid var(--quota); outline-offset: 2px; }
+.op:disabled { opacity: 0.5; cursor: default; }
+
+/* 删除：危险色，且与下载拉开间距，防误触 */
+.ops { white-space: nowrap; }
+.ops .op { margin-right: 12px; }
+.ops form.inline { display: inline; }
+button.danger {
+  color: #fff;
+  background: var(--danger);
+  border-color: var(--danger);
+}
+button.danger:active { background: #8c1d17; }
+
+.banner {
+  margin: 0 0 8px;
+  padding: 8px 12px;
+  border-radius: 4px;
+}
+.banner.error {
+  background: #fdecea;
+  color: var(--danger);
+  border: 1px solid var(--danger);
+}
+
+.folder {
+  margin: 0 0 4px;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+/* 容量条：超配额变红，同时页面有文字提示，不只靠颜色 */
+.quota-bar {
+  height: 12px;
+  background: #e4e6e9;
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 4px 0 10px;
+}
+.quota-used {
+  height: 100%;
+  max-width: 100%;
+  background: var(--quota);
+}
+.quota-bar.over .quota-used { background: var(--danger); }
+
+/* 文件表：局部滚动，表头固定，长文件名截断 */
+.card-files {
+  max-height: 40vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.card-files table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.card-files th,
+.card-files td {
+  padding: 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.card-files th {
+  position: sticky;
+  top: 0;
+  background: var(--card-bg); /* 不设背景会透出下面滚过的行 */
+}
+.card-files td.filename {
+  max-width: 16em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 等宽数字 + 右对齐，扫读文件大小 */
+.card-files td.size,
+.card-files th.size {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.card-files td.mtime {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.empty { color: var(--muted); }
