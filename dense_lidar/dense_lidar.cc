@@ -200,6 +200,7 @@ class FrameSink {
     std::string error;
     if (!dense_lidar::WritePcd(path.string(), points, frame.points_num, fields_, binary_,
                                &error)) {
+      had_error_.store(true);
       std::fprintf(stderr, "[dense_lidar] frame %d write failed: %s\n", frame.frame_index,
                    error.c_str());
       return;
@@ -221,6 +222,7 @@ class FrameSink {
     std::string error;
     if (!merged_open_) {
       if (!merged_.Open(merged_path_, fields_, binary_, &error)) {
+        had_error_.store(true);
         std::fprintf(stderr, "[dense_lidar] open %s failed: %s\n", merged_path_.c_str(),
                      error.c_str());
         return;
@@ -229,6 +231,7 @@ class FrameSink {
     }
     const Point* points = PreparePoints(frame);
     if (!merged_.Append(points, frame.points_num, &error)) {
+      had_error_.store(true);
       std::fprintf(stderr, "[dense_lidar] frame %d append failed: %s\n", frame.frame_index,
                    error.c_str());
       return;
@@ -248,6 +251,7 @@ class FrameSink {
     }
     std::string error;
     if (!merged_.Close(&error)) {
+      had_error_.store(true);
       std::fprintf(stderr, "[dense_lidar] finalize %s failed: %s\n", merged_path_.c_str(),
                    error.c_str());
       return;
@@ -260,6 +264,7 @@ class FrameSink {
   uint64_t last_frame_us() const { return last_frame_us_.load(); }
   uint64_t frame_count() const { return frame_count_.load(); }
   uint64_t point_count() const { return point_count_.load(); }
+  bool had_error() const { return had_error_.load(); }
   const std::string& merged_path() const { return merged_path_; }
 
  private:
@@ -275,10 +280,11 @@ class FrameSink {
   // 转台模式下每帧变换后的点，复用同一块内存避免反复分配。
   std::vector<Point> transformed_;
 
-  // 回调在 SDK 线程里执行，停止线程轮询读取，因此用原子量。
+  // 回调在 SDK 线程里执行，其他线程读取状态，因此用原子量。
   std::atomic<uint64_t> last_frame_us_{0};
   std::atomic<uint64_t> frame_count_{0};
   std::atomic<uint64_t> point_count_{0};
+  std::atomic<bool> had_error_{false};
 };
 
 // pcap -> pcd 转换流程：初始化 SDK、跑到 pcap 结束、回收资源。
@@ -326,7 +332,7 @@ class Converter {
   }
 
   // pcap 播放结束后 SDK 不会主动退出，这里等待 EOF 且 1 秒内没有新帧再收尾。
-  void RunToEnd() {
+  bool RunToEnd() {
     while (!sdk_.lidar_ptr_->IsPlayEnded() || GetMicroTickCountU64() - sink_.last_frame_us() < 1000000) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -338,6 +344,7 @@ class Converter {
     std::printf("[dense_lidar] done: %llu frames, %llu points\n",
                 static_cast<unsigned long long>(sink_.frame_count()),
                 static_cast<unsigned long long>(sink_.point_count()));
+    return !sink_.had_error();
   }
 
  private:
@@ -392,8 +399,7 @@ int Run(int argc, char* argv[]) {
   if (!converter.Init()) {
     return 1;
   }
-  converter.RunToEnd();
-  return 0;
+  return converter.RunToEnd() ? 0 : 1;
 }
 
 }  // namespace
