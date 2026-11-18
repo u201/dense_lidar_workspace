@@ -21,4 +21,5 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('artifact/', include('artifact.urls')),
     path('lidar/', include('lidar.urls')),
+    path('action/', include('action.urls')),
 ]
