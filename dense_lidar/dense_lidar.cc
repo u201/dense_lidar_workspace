@@ -139,6 +139,10 @@ ParseStatus ParseOptions(int argc, char* argv[], Options* options) {
   options->play_synchronization = result["sync"].as<bool>();
   options->turntable.first_frame = result["first"].as<int>();
   options->turntable.seconds_per_revolution = result["seconds-per-revolution"].as<double>();
+  if (options->turntable.seconds_per_revolution < 0.0) {
+    std::cerr << "Invalid --seconds-per-revolution: must be >= 0." << std::endl;
+    return ParseStatus::kError;
+  }
   options->turntable.hz = result["hz"].as<double>();
   options->turntable.alpha1 = static_cast<float>(result["a1"].as<double>());
   options->turntable.alpha2 = static_cast<float>(result["a2"].as<double>());
