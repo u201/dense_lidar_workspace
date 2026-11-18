@@ -39,6 +39,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'artifact',
     'lidar',
+    'action',
 ]
 
 MIDDLEWARE = [
