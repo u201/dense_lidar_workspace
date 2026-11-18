@@ -1,5 +1,9 @@
 {# 卡片外壳：门户 include 它；永不整体替换，只有 #lidar-body 会被片段刷新 #}
-<section class="card" id="lidar-card">
+<section class="card" id="lidar-card"
+         hx-get="{% url 'lidar:card' %}"
+         hx-trigger="lidar-refresh from:body"
+         hx-target="#lidar-body"
+         hx-swap="innerHTML">
   <header class="card-header">
     <h2>Lidar</h2>
     <button class="op"
