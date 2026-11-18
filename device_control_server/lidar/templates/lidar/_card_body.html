@@ -1,0 +1,12 @@
+{# 卡片内容：首屏由 index 渲染，刷新后由 card 视图重渲染 #}
+<p class="status status-{{ status }}">{{ status_label }}</p>
+
+<p class="folder">{{ device|default:"（未配置设备地址）" }}</p>
+
+{% if mode_label %}
+  <p>待机模式：{{ mode }} · {{ mode_label }}</p>
+{% endif %}
+
+{% if detail %}
+  <p class="banner error">{{ detail }}</p>
+{% endif %}
