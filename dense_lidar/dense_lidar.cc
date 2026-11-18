@@ -22,22 +22,22 @@ using dense_lidar::Field;
 using dense_lidar::Point;
 using Frame = hesai::lidar::LidarDecodedFrame<Point>;
 
-// 转台参数：每帧转过的角度 = 360 / (duration * hz)。
+// 转台参数：每帧转过的角度 = 360 / (seconds_per_revolution * hz)。
 struct Turntable {
   int first_frame = 0;
-  double duration = 0.0;  // 转满 360° 的秒数，0 表示不旋转
+  double seconds_per_revolution = 0.0;  // 转满 360° 的秒数，0 表示不旋转
   double hz = 10.0;
   float alpha1 = 0.0f;  // 度
   float alpha2 = 0.0f;  // 度
   float arm = 0.0f;     // 米
   bool ccw = false;     // false 为俯视顺时针
 
-  bool enabled() const { return duration > 0.0; }
+  bool enabled() const { return seconds_per_revolution > 0.0; }
 
   // 该帧转台累计转过的角度（度），顺时针为正。
   double angle_degrees(int frame_index) const {
     const double sign = ccw ? -1.0 : 1.0;
-    return sign * static_cast<double>(frame_index - first_frame) * 360.0 / (duration * hz);
+    return sign * static_cast<double>(frame_index - first_frame) * 360.0 / (seconds_per_revolution * hz);
   }
 };
 
@@ -76,15 +76,15 @@ ParseStatus ParseOptions(int argc, char* argv[], Options* options) {
       ("sync", "Follow pcap timestamps; omit to parse as fast as possible",
        cxxopts::value<bool>()->default_value("false"))
       ("first", "First frame index to process", cxxopts::value<int>()->default_value("0"))
-      ("d,duration",
+      ("s,seconds-per-revolution",
        "Turntable rotation time for 360 degrees in seconds; 0 disables rotation",
        cxxopts::value<double>()->default_value("0"))
       ("hz", "Lidar frame rate in Hz", cxxopts::value<double>()->default_value("10"))
       ("a1", "Alpha1 calibration angle in degrees", cxxopts::value<double>()->default_value("0"))
       ("a2", "Alpha2 calibration angle in degrees", cxxopts::value<double>()->default_value("0"))
       ("r,arm", "Arm length in meters", cxxopts::value<double>()->default_value("0"))
-      ("ccw", "Turntable rotates counter-clockwise seen from above (default: clockwise)",
-       cxxopts::value<bool>()->default_value("false"))
+      ("d,direction", "Turntable rotates clockwise (cw) or counter-clockwise (ccw) seen from above",
+       cxxopts::value<std::string>()->default_value("cw"))
       ("h,help", "Print help message");
 
   auto result = cli.parse(argc, argv);
@@ -138,14 +138,22 @@ ParseStatus ParseOptions(int argc, char* argv[], Options* options) {
   options->merge = !result["per-frame"].as<bool>();
   options->play_synchronization = result["sync"].as<bool>();
   options->turntable.first_frame = result["first"].as<int>();
-  options->turntable.duration = result["duration"].as<double>();
+  options->turntable.seconds_per_revolution = result["seconds-per-revolution"].as<double>();
   options->turntable.hz = result["hz"].as<double>();
   options->turntable.alpha1 = static_cast<float>(result["a1"].as<double>());
   options->turntable.alpha2 = static_cast<float>(result["a2"].as<double>());
   options->turntable.arm = static_cast<float>(result["arm"].as<double>());
-  options->turntable.ccw = result["ccw"].as<bool>();
+
+  const std::string direction = result["direction"].as<std::string>();
+  if (direction != "cw" && direction != "ccw") {
+    std::cerr << "Invalid --direction: must be 'cw' or 'ccw'." << std::endl;
+    return ParseStatus::kError;
+  }
+  options->turntable.ccw = (direction == "ccw");
+
   if (options->turntable.enabled() && options->turntable.hz <= 0.0) {
-    std::cerr << "Invalid --hz: must be positive when --duration is set." << std::endl;
+    std::cerr << "Invalid --hz: must be positive when --seconds-per-revolution is set."
+              << std::endl;
     return ParseStatus::kError;
   }
   return ParseStatus::kOk;
@@ -371,11 +379,11 @@ class Converter {
       std::printf(
           "[dense_lidar] turntable: %.3f s / 360 deg, %.3f Hz, arm %.4f m, alpha1 %.4f deg, "
           "alpha2 %.4f deg, %s\n",
-          options_.turntable.duration, options_.turntable.hz, options_.turntable.arm,
+          options_.turntable.seconds_per_revolution, options_.turntable.hz, options_.turntable.arm,
           options_.turntable.alpha1, options_.turntable.alpha2,
           options_.turntable.ccw ? "counter-clockwise" : "clockwise");
     } else {
-      std::printf("[dense_lidar] turntable: disabled (duration is 0)\n");
+      std::printf("[dense_lidar] turntable: disabled (seconds per revolution is 0)\n");
     }
   }
 
