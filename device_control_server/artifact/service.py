@@ -11,6 +11,7 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,16 @@ def parse_quota_bytes(value: Any) -> int | None:
     return value
 
 
+def platform_folder_key() -> str:
+    """按运行平台选择目录配置键：Windows 用 win_local_folder，其余用 linux_local_folder。"""
+    return 'win_local_folder' if sys.platform == 'win32' else 'linux_local_folder'
+
+
+def read_local_folder(section: dict[str, Any]) -> Any:
+    """读取当前平台对应的目录配置值。"""
+    return section.get(platform_folder_key())
+
+
 def resolve_local_folder(raw: Any) -> Path | None:
     """展开 $VAR 与 ~，相对路径锚定 BASE_DIR（不是 cwd）。"""
     if not isinstance(raw, str) or not raw.strip():
@@ -78,7 +89,7 @@ def _resolve_state() -> dict[str, Any]:
     返回里带 resolve 后的 Path（键 folder），供扫描与将来 Recorder 检查使用。
     """
     section, config_error = load_artifact_config()
-    raw_folder = section.get('local_folder')
+    raw_folder = read_local_folder(section)
     quota_bytes = parse_quota_bytes(section.get('quota_bytes'))
     folder = resolve_local_folder(raw_folder)
 
@@ -88,7 +99,7 @@ def _resolve_state() -> dict[str, Any]:
 
     error = config_error
     if error is None and folder is None:
-        error = '配置缺少 artifact.local_folder'
+        error = f'配置缺少或非法的 artifact.{platform_folder_key()}'
     elif error is None and quota_bytes is None:
         error = '配置缺少或非法的 artifact.quota_bytes'
 
@@ -185,7 +196,7 @@ def resolve_file(filename: str) -> Path | None:
     section, config_error = load_artifact_config()
     if config_error is not None:
         return None
-    folder = resolve_local_folder(section.get('local_folder'))
+    folder = resolve_local_folder(read_local_folder(section))
     if folder is None:
         return None
     path = folder / filename
