@@ -154,3 +154,14 @@ button.danger:active { background: #8c1d17; }
 }
 
 .empty { color: var(--muted); }
+
+/* 设备状态：文字本身带语义，颜色只做强化，不只靠颜色传意 */
+.status {
+  margin: 0 0 8px;
+  font-size: 20px;
+  font-weight: 600;
+}
+.status-ok { color: #1e7d32; }
+.status-offline { color: var(--muted); }
+.status-abnormal,
+.status-config_error { color: var(--danger); }
