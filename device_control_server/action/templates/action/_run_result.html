@@ -1,0 +1,16 @@
+<p class="status status-{{ run.status_class }}">{{ run.status_label }}</p>
+<p class="folder">run_id: {{ run.run_id }}</p>
+
+{% if run.error %}
+  <p class="banner error">{{ run.error.code }}: {{ run.error.message }}</p>
+{% endif %}
+
+{% for step in run.steps %}
+  <p>步骤 {{ step.index }} · {{ step.command }} · {{ step.status }} · {{ step.duration_ms }} ms</p>
+  {% if step.error %}
+    <p class="banner error">{{ step.error.code }}: {{ step.error.message }}</p>
+  {% endif %}
+  {% if step.result %}
+    <p class="folder">{{ step.result }}</p>
+  {% endif %}
+{% endfor %}

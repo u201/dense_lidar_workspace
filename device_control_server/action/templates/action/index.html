@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+
+{% block title %}Actions{% endblock %}
+
+{% block content %}
+  {% if file_error %}
+    <section class="card">
+      <p class="banner error">{{ file_error }}</p>
+    </section>
+  {% endif %}
+
+  {% for action in actions %}
+    {% include "action/_card.html" %}
+  {% empty %}
+    {% if not file_error %}
+      <section class="card"><p class="empty">没有可用 action</p></section>
+    {% endif %}
+  {% endfor %}
+{% endblock %}

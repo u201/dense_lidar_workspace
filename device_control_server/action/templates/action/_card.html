@@ -1,0 +1,57 @@
+{# 执行只替换 #action-result-*，不替换整张卡片，避免输入焦点丢失 #}
+<section class="card" id="action-{{ forloop.counter }}">
+  <header class="card-header">
+    <h2>{{ action.title }}</h2>
+  </header>
+
+  {% if action.description %}
+    <p class="folder">{{ action.description }}</p>
+  {% endif %}
+
+  {% if action.errors %}
+    <p class="banner error">定义无效：{{ action.errors|join:"；" }}</p>
+  {% else %}
+    <form hx-post="{% url 'action:run' action.action_id %}"
+          hx-target="#action-result-{{ action.action_id }}"
+          hx-swap="innerHTML"
+          hx-sync="this:replace"
+          hx-disabled-elt="find button"
+          hx-confirm="确定执行 {{ action.title }}？">
+      {% csrf_token %}
+
+      {% for step in action.steps %}
+        {% for field in step.fields %}
+          <p>
+            <label>
+              {{ field.label }}
+              {% if field.choices %}
+                <select name="step_{{ forloop.parentloop.counter0 }}_{{ field.name }}">
+                  {% for choice in field.choices %}
+                    <option value="{{ choice.value }}"
+                            {% if choice.selected %}selected{% endif %}>
+                      {{ choice.label }}
+                    </option>
+                  {% endfor %}
+                </select>
+              {% elif field.type == 'integer' or field.type == 'number' %}
+                <input type="number"
+                       name="step_{{ forloop.parentloop.counter0 }}_{{ field.name }}"
+                       value="{{ field.value|default:'' }}"
+                       {% if field.type == 'number' %}step="any"{% endif %}>
+              {% else %}
+                <input type="text"
+                       name="step_{{ forloop.parentloop.counter0 }}_{{ field.name }}"
+                       value="{{ field.value|default:'' }}">
+              {% endif %}
+            </label>
+          </p>
+          {% if field.help %}<p class="folder">{{ field.help }}</p>{% endif %}
+        {% endfor %}
+      {% endfor %}
+
+      <button class="op" type="submit">执行</button>
+    </form>
+  {% endif %}
+
+  <div id="action-result-{{ action.action_id }}"></div>
+</section>
