@@ -36,12 +36,12 @@
               {% elif field.type == 'integer' or field.type == 'number' %}
                 <input type="number"
                        name="step_{{ forloop.parentloop.counter0 }}_{{ field.name }}"
-                       value="{{ field.value|default:'' }}"
+                       value="{{ field.value|default_if_none:'' }}"
                        {% if field.type == 'number' %}step="any"{% endif %}>
               {% else %}
                 <input type="text"
                        name="step_{{ forloop.parentloop.counter0 }}_{{ field.name }}"
-                       value="{{ field.value|default:'' }}">
+                       value="{{ field.value|default_if_none:'' }}">
               {% endif %}
             </label>
           </p>
