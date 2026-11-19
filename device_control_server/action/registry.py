@@ -9,6 +9,7 @@ from importlib import import_module
 from typing import Any
 
 COMMAND_MODULES = (
+    'lidar.commands',
 )
 
 
