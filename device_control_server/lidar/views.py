@@ -4,11 +4,15 @@ from django.http import HttpRequest, HttpResponse
 from django.shortcuts import render
 from django.views.decorators.http import require_http_methods
 
-from drivers import lidar as lidar_driver
+from lidar.service import (
+    MODE_IN_OPERATION, MODE_STANDBY,
+    LidarConfigError, LidarUnreachableError, LidarResponseError,
+    load_config, get_standby_mode,
+)
 
 MODE_DISPLAY = {
-    lidar_driver.MODE_IN_OPERATION: '运行 In Operation',
-    lidar_driver.MODE_STANDBY: '待机 Standby',
+    MODE_IN_OPERATION: '运行 In Operation',
+    MODE_STANDBY: '待机 Standby',
 }
 
 
@@ -18,8 +22,8 @@ def _status_context() -> dict:
     每次请求都实时查询，不缓存：页面上的“在线”必须是本次探测的结果。
     """
     try:
-        cfg = lidar_driver.load_config()
-    except lidar_driver.LidarConfigError as exc:
+        cfg = load_config()
+    except LidarConfigError as exc:
         return {
             'status': 'config_error',
             'status_label': '配置错误',
@@ -31,8 +35,8 @@ def _status_context() -> dict:
 
     device = f'{cfg["host"]}:{cfg["port"]}'
     try:
-        mode = lidar_driver.get_standby_mode(cfg)
-    except lidar_driver.LidarUnreachableError as exc:
+        mode = get_standby_mode(cfg)
+    except LidarUnreachableError as exc:
         return {
             'status': 'offline',
             'status_label': '离线',
@@ -41,7 +45,7 @@ def _status_context() -> dict:
             'mode_label': None,
             'detail': str(exc),
         }
-    except lidar_driver.LidarResponseError as exc:
+    except LidarResponseError as exc:
         return {
             'status': 'abnormal',
             'status_label': '设备异常',

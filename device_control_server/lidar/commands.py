@@ -7,21 +7,24 @@ handler 不接触 Django request，只接收已校验参数与运行上下文。
 from typing import Any
 
 from action.registry import CommandError
-from drivers import lidar as lidar_driver
+from lidar.service import (
+    LidarArgumentError, LidarConfigError, LidarUnreachableError, LidarResponseError,
+    load_config, set_standby_mode,
+)
 
 
 def standby(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     """设置待机模式，成功后返回设备地址与实际设置值。"""
     try:
-        cfg = lidar_driver.load_config()
-        lidar_driver.set_standby_mode(args['mode'], cfg)
-    except lidar_driver.LidarArgumentError as exc:
+        cfg = load_config()
+        set_standby_mode(args['mode'], cfg)
+    except LidarArgumentError as exc:
         raise CommandError('invalid_args', str(exc))
-    except lidar_driver.LidarConfigError as exc:
+    except LidarConfigError as exc:
         raise CommandError('config_error', str(exc))
-    except lidar_driver.LidarUnreachableError as exc:
+    except LidarUnreachableError as exc:
         raise CommandError('device_unreachable', str(exc))
-    except lidar_driver.LidarResponseError as exc:
+    except LidarResponseError as exc:
         raise CommandError(
             'device_error',
             str(exc),
