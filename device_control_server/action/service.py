@@ -482,7 +482,12 @@ def load_instance(instance_id: str) -> dict[str, Any] | None:
         instance = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError):
         return None
-    return instance if isinstance(instance, dict) else None
+    if not isinstance(instance, dict):
+        return None
+    # 文件内容与文件名不一致时不能返回：后续 save_instance 会写到另一个文件。
+    if instance.get('instance_id') != instance_id:
+        return None
+    return instance
 
 
 def iter_instances(status: str | None = None) -> Iterator[dict[str, Any]]:
@@ -492,10 +497,20 @@ def iter_instances(status: str | None = None) -> Iterator[dict[str, Any]]:
             instance = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError):
             continue
-        if not isinstance(instance, dict) or 'instance_id' not in instance:
+        if not isinstance(instance, dict):
             continue
-        if status is None or instance.get('status') == status:
-            yield instance
+
+        # instance_id 必须与文件名一致且合法：actor 保存状态时按 instance_id
+        # 定位文件，不一致会写到另一个文件，原文件永远 pending，导致重复执行。
+        instance_id = instance.get('instance_id')
+        if (not isinstance(instance_id, str)
+                or instance_id != path.stem
+                or not INSTANCE_ID_RE.fullmatch(instance_id)):
+            continue
+
+        if status is not None and instance.get('status') != status:
+            continue
+        yield instance
 
 
 def schedule_action(action_id: str, raw_scheduled_at: str,
@@ -525,7 +540,8 @@ def schedule_action(action_id: str, raw_scheduled_at: str,
 
     created_at = datetime.now(timezone.utc)
     instance = {
-        'instance_id': f'{action_id}-{created_at:%Y%m%dT%H%M%S%fZ}',
+        # 只用数字时间戳：INSTANCE_ID_RE 仅允许小写，避免 ISO 的 T/Z 大写。
+        'instance_id': f'{action_id}-{created_at:%Y%m%d%H%M%S%f}',
         'action_id': action_id,
         'title': action['title'],
         'scheduled_at': iso_utc(scheduled_at),
