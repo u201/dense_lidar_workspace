@@ -1,0 +1,41 @@
+{# 预约队列：只列已预约、未执行、未失效的实例 #}
+{% if error %}
+  <p class="banner error">{{ error }}</p>
+{% endif %}
+
+{% if pending_instances %}
+  <div class="card-files">
+    <table>
+      <thead>
+        <tr>
+          <th>动作</th>
+          <th>计划执行（UTC+8）</th>
+          <th>创建（UTC+8）</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for instance in pending_instances %}
+          <tr>
+            <td>{{ instance.title }}</td>
+            <td class="mtime">{{ instance.scheduled_local }}</td>
+            <td class="mtime">{{ instance.created_local }}</td>
+            <td class="ops">
+              <form class="inline"
+                    hx-post="{% url 'action:cancel' instance.instance_id %}"
+                    hx-target="#pending-body"
+                    hx-swap="innerHTML"
+                    hx-disabled-elt="find button"
+                    hx-confirm="取消预约 {{ instance.title }}？">
+                {% csrf_token %}
+                <button class="op danger" type="submit">取消</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  <p class="empty">队列为空</p>
+{% endif %}
