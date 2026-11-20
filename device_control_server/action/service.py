@@ -1,17 +1,21 @@
-"""Action 服务：读取/校验 actions.json，并同步执行 action。
+"""Action 服务：读取/校验 actions.json，并同步或预约执行 action。
 
-本阶段执行器由 Django 请求直接调用，仅面向瞬时 command。
-后续 action worker 复用同一注册表、同一定义文件与本执行器，不另写一套。
+同步执行与预约执行共用 execute_steps，区别只在 steps 的来源：
+- 同步执行：actions.json 模板 + 表单覆盖值，即时解析后执行；
+- 预约执行：解析后的 steps 快照落盘为实例文件，daemon/actor.py 只读快照。
+
+页面上的时间输入按固定 UTC+8 解释，实例文件里的时间一律存 UTC。
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from django.conf import settings
 
@@ -19,7 +23,55 @@ from .registry import CommandError, get_registry
 
 ACTIONS_PATH = Path(settings.BASE_DIR) / 'actions.json'
 ACTION_ID_RE = re.compile(r'^[a-z][a-z0-9_]*$')
+INSTANCE_ID_RE = re.compile(r'^[a-z][a-z0-9_-]*$')
 
+# datetime-local 输入框按固定 UTC+8 解释，与页面标签一致。
+INPUT_TZ = timezone(timedelta(hours=8))
+EXPIRE_AFTER_SECONDS = int(getattr(
+    settings, 'ACTION_INSTANCE_EXPIRE_SECONDS', 600))
+
+
+# ---------------------------------------------------------------------------
+# 时间
+# ---------------------------------------------------------------------------
+
+def iso_utc(value: datetime) -> str:
+    """统一落盘格式：UTC ISO 8601，以 Z 结尾。"""
+    return value.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def parse_utc(text: str) -> datetime:
+    return datetime.fromisoformat(text.replace('Z', '+00:00'))
+
+
+def _parse_scheduled_at(raw: str) -> datetime:
+    """把 datetime-local 的墙钟字符串按 UTC+8 转为 UTC。"""
+    text = raw.strip()
+    if not text:
+        raise ValueError('请填写预约时间（UTC+8）')
+
+    for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M'):
+        try:
+            wall_clock = datetime.strptime(text, fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        raise ValueError(f'无法识别预约时间: {text!r}')
+
+    scheduled_at = wall_clock.replace(tzinfo=INPUT_TZ).astimezone(timezone.utc)
+    if scheduled_at <= datetime.now(timezone.utc):
+        raise ValueError('预约时间必须晚于当前时间')
+    return scheduled_at
+
+
+def _format_local(text: str) -> str:
+    return parse_utc(text).astimezone(INPUT_TZ).strftime('%Y-%m-%d %H:%M:%S')
+
+
+# ---------------------------------------------------------------------------
+# actions.json
+# ---------------------------------------------------------------------------
 
 def load_actions() -> tuple[list[dict[str, Any]], str | None]:
     """每次请求重新读取定义；单个 action 非法不影响其他 action。"""
@@ -213,14 +265,88 @@ def parse_overrides(post: Mapping[str, str]) -> dict[int, dict[str, str]]:
     return overrides
 
 
+# ---------------------------------------------------------------------------
+# 执行（同步与 actor 共用）
+# ---------------------------------------------------------------------------
+
 def execute_action(action_id: str,
                    overrides: dict[int, dict[str, str]] | None = None
                    ) -> dict[str, Any]:
     """同步执行 action，任一步失败即停止并保留错误。"""
+    actions, file_error = load_actions()
+    if file_error:
+        return _failure_run(action_id, 'actions_file_error', file_error)
+
+    action = next((item for item in actions
+                   if item['action_id'] == action_id), None)
+    if action is None:
+        return _failure_run(action_id, 'action_not_found',
+                            f'action 不存在: {action_id}')
+    if action['errors']:
+        return _failure_run(action_id, 'invalid_action',
+                            '；'.join(action['errors']))
+
+    steps, arg_error = _resolve_steps(action, overrides or {})
+    run = _new_run(action_id)
+    succeeded = _run_steps(steps, run, action_id)
+
+    if arg_error and succeeded:
+        # 参数出错的步骤之前都执行成功，把该步骤补记为失败，便于页面定位。
+        run['steps'].append({
+            'index': arg_error['index'],
+            'command': arg_error['command'],
+            'args': arg_error['args'],
+            'status': 'failed',
+            'result': None,
+            'error': {'code': 'invalid_args',
+                      'message': arg_error['message']},
+            'duration_ms': 0,
+        })
+        succeeded = False
+
+    if succeeded and len(run['steps']) == len(action['steps']):
+        run['status'] = 'succeeded'
+    return _finish_run(run)
+
+
+def execute_steps(steps: list[dict[str, Any]],
+                  action_id: str) -> dict[str, Any]:
+    """执行已解析的步骤快照；同步执行与 actor 共用同一份逻辑。"""
+    run = _new_run(action_id)
+    succeeded = _run_steps(steps, run, action_id)
+    if succeeded and len(run['steps']) == len(steps):
+        run['status'] = 'succeeded'
+    return _finish_run(run)
+
+
+def execute_instance(instance: dict[str, Any]) -> dict[str, Any]:
+    return execute_steps(instance.get('steps', []), instance['action_id'])
+
+
+def _resolve_steps(action: dict[str, Any],
+                   overrides: dict[int, dict[str, str]]
+                   ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """把模板步骤解析成可执行的 steps 快照，返回首个参数错误。"""
+    steps: list[dict[str, Any]] = []
+    for index, step in enumerate(action['steps']):
+        args = dict(step['args'])
+        errors = _apply_overrides(step['definition'], args,
+                                  overrides.get(index, {}))
+        if errors:
+            return steps, {
+                'index': index,
+                'command': step['command'],
+                'args': args,
+                'message': '；'.join(errors),
+            }
+        steps.append({'command': step['command'], 'args': args})
+    return steps, None
+
+
+def _new_run(action_id: str) -> dict[str, Any]:
     started_at = datetime.now(timezone.utc)
-    run_id = f'{action_id}-{started_at:%Y%m%dT%H%M%S%fZ}'
-    run = {
-        'run_id': run_id,
+    return {
+        'run_id': f'{action_id}-{started_at:%Y%m%dT%H%M%S%fZ}',
         'action_id': action_id,
         'status': 'failed',
         'started_at': started_at.isoformat(),
@@ -229,44 +355,15 @@ def execute_action(action_id: str,
         'error': None,
     }
 
-    actions, file_error = load_actions()
-    if file_error:
-        run['error'] = {'code': 'actions_file_error', 'message': file_error}
-        return _finish_run(run)
 
-    action = next((item for item in actions
-                   if item['action_id'] == action_id), None)
-    if action is None:
-        run['error'] = {'code': 'action_not_found',
-                        'message': f'action 不存在: {action_id}'}
-        return _finish_run(run)
-    if action['errors']:
-        run['error'] = {'code': 'invalid_action',
-                        'message': '；'.join(action['errors'])}
-        return _finish_run(run)
-
-    overrides = overrides or {}
-    for index, step in enumerate(action['steps']):
-        args = dict(step['args'])
-        arg_errors = _apply_overrides(step['definition'], args,
-                                      overrides.get(index, {}))
-        if arg_errors:
-            run['steps'].append({
-                'index': index,
-                'command': step['command'],
-                'args': args,
-                'status': 'failed',
-                'result': None,
-                'error': {'code': 'invalid_args',
-                          'message': '；'.join(arg_errors)},
-                'duration_ms': 0,
-            })
-            break
-
+def _run_steps(steps: list[dict[str, Any]], run: dict[str, Any],
+               action_id: str) -> bool:
+    registry = get_registry()
+    for index, step in enumerate(steps):
         step_run = {
             'index': index,
             'command': step['command'],
-            'args': args,
+            'args': step['args'],
             'status': 'succeeded',
             'result': None,
             'error': None,
@@ -274,8 +371,12 @@ def execute_action(action_id: str,
         }
         started = time.monotonic()
         try:
-            step_run['result'] = step['definition']['handler'](
-                args, {'run_id': run_id, 'action_id': action_id})
+            definition = registry.get(step['command'])
+            if definition is None:
+                raise CommandError('unknown_command',
+                                   f'command 已不在注册表: {step["command"]}')
+            step_run['result'] = definition['handler'](
+                step['args'], {'run_id': run['run_id'], 'action_id': action_id})
         except CommandError as exc:
             step_run['status'] = 'failed'
             step_run['error'] = {
@@ -292,12 +393,19 @@ def execute_action(action_id: str,
         step_run['duration_ms'] = round((time.monotonic() - started) * 1000)
         run['steps'].append(step_run)
         if step_run['status'] == 'failed':
-            break
+            return False
+    return True
 
-    if len(run['steps']) == len(action['steps']) and all(
-            step['status'] == 'succeeded' for step in run['steps']):
-        run['status'] = 'succeeded'
+
+def _failure_run(action_id: str, code: str, message: str) -> dict[str, Any]:
+    run = _new_run(action_id)
+    run['error'] = {'code': code, 'message': message}
     return _finish_run(run)
+
+
+def _finish_run(run: dict[str, Any]) -> dict[str, Any]:
+    run['finished_at'] = datetime.now(timezone.utc).isoformat()
+    return run
 
 
 def _apply_overrides(definition: dict[str, Any], args: dict[str, Any],
@@ -339,6 +447,135 @@ def _coerce_form_value(param: dict[str, Any], raw: str) -> tuple[Any, str | None
         return None, f'无法转换为 {param["type"]}: {raw!r}'
 
 
-def _finish_run(run: dict[str, Any]) -> dict[str, Any]:
-    run['finished_at'] = datetime.now(timezone.utc).isoformat()
-    return run
+# ---------------------------------------------------------------------------
+# 预约实例
+# ---------------------------------------------------------------------------
+
+def _instance_dir() -> Path:
+    directory = Path(settings.ACTION_INSTANCE_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _instance_path(instance_id: str) -> Path:
+    if not INSTANCE_ID_RE.fullmatch(instance_id):
+        raise ValueError(f'非法实例 ID: {instance_id!r}')
+    return _instance_dir() / f'{instance_id}.json'
+
+
+def save_instance(instance: dict[str, Any]) -> None:
+    """原子写：先写 .tmp 再 os.replace，避免读到半个文件。"""
+    path = _instance_path(instance['instance_id'])
+    tmp_path = path.with_suffix('.json.tmp')
+    tmp_path.write_text(
+        json.dumps(instance, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8')
+    os.replace(tmp_path, path)
+
+
+def load_instance(instance_id: str) -> dict[str, Any] | None:
+    try:
+        path = _instance_path(instance_id)
+    except ValueError:
+        return None
+    try:
+        instance = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return instance if isinstance(instance, dict) else None
+
+
+def iter_instances(status: str | None = None) -> Iterator[dict[str, Any]]:
+    """按文件名顺序读取实例；坏文件跳过，不影响其他实例。"""
+    for path in sorted(_instance_dir().glob('*.json')):
+        try:
+            instance = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(instance, dict) or 'instance_id' not in instance:
+            continue
+        if status is None or instance.get('status') == status:
+            yield instance
+
+
+def schedule_action(action_id: str, raw_scheduled_at: str,
+                    overrides: dict[int, dict[str, str]] | None = None
+                    ) -> tuple[dict[str, Any] | None, str | None]:
+    """校验模板、参数和时间后，落盘一个 pending 实例。"""
+    try:
+        scheduled_at = _parse_scheduled_at(raw_scheduled_at)
+    except ValueError as exc:
+        return None, str(exc)
+
+    actions, file_error = load_actions()
+    if file_error:
+        return None, file_error
+
+    action = next((item for item in actions
+                   if item['action_id'] == action_id), None)
+    if action is None:
+        return None, f'action 不存在: {action_id}'
+    if action['errors']:
+        return None, '；'.join(action['errors'])
+
+    steps, arg_error = _resolve_steps(action, overrides or {})
+    if arg_error:
+        return None, (f'step {arg_error["index"]} 参数错误: '
+                      f'{arg_error["message"]}')
+
+    created_at = datetime.now(timezone.utc)
+    instance = {
+        'instance_id': f'{action_id}-{created_at:%Y%m%dT%H%M%S%fZ}',
+        'action_id': action_id,
+        'title': action['title'],
+        'scheduled_at': iso_utc(scheduled_at),
+        'expire_after_seconds': EXPIRE_AFTER_SECONDS,
+        'status': 'pending',
+        'created_at': iso_utc(created_at),
+        'started_at': None,
+        'finished_at': None,
+        'steps': steps,
+        'run': None,
+        'error': None,
+    }
+    save_instance(instance)
+
+    result = dict(instance)
+    result['scheduled_local'] = _format_local(instance['scheduled_at'])
+    return result, None
+
+
+def list_pending_instances() -> list[dict[str, Any]]:
+    """页面展示用：已预约、未执行且未失效，按计划时间排序。"""
+    now = datetime.now(timezone.utc)
+    pending = []
+    for instance in iter_instances('pending'):
+        try:
+            scheduled_at = parse_utc(instance['scheduled_at'])
+            created_at = parse_utc(instance['created_at'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        expire_after = instance.get('expire_after_seconds', EXPIRE_AFTER_SECONDS)
+        if now - scheduled_at > timedelta(seconds=expire_after):
+            continue
+        item = dict(instance)
+        item['scheduled_local'] = _format_local(instance['scheduled_at'])
+        item['created_local'] = _format_local(instance['created_at'])
+        pending.append(item)
+    pending.sort(key=lambda item: (parse_utc(item['scheduled_at']),
+                                   parse_utc(item['created_at'])))
+    return pending
+
+
+def cancel_instance(instance_id: str) -> str | None:
+    """取消尚未执行的预约；返回错误文案，成功返回 None。"""
+    instance = load_instance(instance_id)
+    if instance is None:
+        return '实例不存在'
+    if instance.get('status') != 'pending':
+        return f'实例状态为 {instance.get("status")}，不能取消'
+
+    instance['status'] = 'cancelled'
+    instance['finished_at'] = iso_utc(datetime.now(timezone.utc))
+    save_instance(instance)
+    return None
