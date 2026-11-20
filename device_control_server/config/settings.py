@@ -107,11 +107,18 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+# 页面上的人工输入统一按 UTC+8 展示；落盘时间一律用 UTC。
+TIME_ZONE = 'Asia/Shanghai'
 
 USE_I18N = True
 
 USE_TZ = True
+
+
+# 预约实例：web 与 daemon/actor.py 共用一个目录，每个实例一个 JSON 文件。
+ACTION_INSTANCE_DIR = BASE_DIR / 'action_instances'
+# 超过 scheduled_at 这么久仍未执行，实例判为失效，actor 不再执行。
+ACTION_INSTANCE_EXPIRE_SECONDS = 600
 
 
 # Static files (CSS, JavaScript, Images)
