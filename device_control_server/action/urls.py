@@ -8,5 +8,8 @@ app_name = 'action'
 
 urlpatterns = [
     path('', views.index, name='index'),
+    path('pending', views.pending, name='pending'),
+    path('pending/<str:instance_id>/cancel', views.cancel, name='cancel'),
     path('<str:action_id>/run', views.run, name='run'),
+    path('<str:action_id>/schedule', views.schedule, name='schedule'),
 ]
