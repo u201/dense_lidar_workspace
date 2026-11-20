@@ -1,0 +1,8 @@
+{% if error %}
+  <p class="status status-abnormal">预约失败</p>
+  <p class="banner error">{{ error }}</p>
+{% else %}
+  <p class="status status-ok">已预约</p>
+  <p class="folder">instance_id: {{ instance.instance_id }}</p>
+  <p>计划执行（UTC+8）：{{ instance.scheduled_local }}</p>
+{% endif %}
