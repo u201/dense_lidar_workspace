@@ -27,8 +27,6 @@ import django  # noqa: E402
 
 django.setup()
 
-from django.conf import settings  # noqa: E402
-
 from action import service  # noqa: E402
 
 logger = logging.getLogger('actor')
@@ -36,7 +34,7 @@ logger = logging.getLogger('actor')
 
 class Actor:
     def __init__(self, poll_interval: float = 1.0) -> None:
-        self.instance_dir = Path(settings.ACTION_INSTANCE_DIR)
+        self.instance_dir = service.load_action_config()['instance_dir']
         self.poll_interval = poll_interval
         self._stop = threading.Event()
 
@@ -73,7 +71,7 @@ class Actor:
         entries.sort(key=lambda entry: entry[0])
         for (scheduled_at, _), instance in entries:
             expire_after = instance.get('expire_after_seconds',
-                                        service.EXPIRE_AFTER_SECONDS)
+                                        service.get_expire_after_seconds())
             if now - scheduled_at > timedelta(seconds=expire_after):
                 self._expire(instance, now, expire_after)
             elif scheduled_at <= now:

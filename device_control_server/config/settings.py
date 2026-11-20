@@ -115,12 +115,6 @@ USE_I18N = True
 USE_TZ = True
 
 
-# 预约实例：web 与 daemon/actor.py 共用一个目录，每个实例一个 JSON 文件。
-ACTION_INSTANCE_DIR = BASE_DIR / 'action_instances'
-# 超过 scheduled_at 这么久仍未执行，实例判为失效，actor 不再执行。
-ACTION_INSTANCE_EXPIRE_SECONDS = 600
-
-
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 

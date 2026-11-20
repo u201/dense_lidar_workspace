@@ -27,8 +27,12 @@ INSTANCE_ID_RE = re.compile(r'^[a-z][a-z0-9_-]*$')
 
 # datetime-local 输入框按固定 UTC+8 解释，与页面标签一致。
 INPUT_TZ = timezone(timedelta(hours=8))
-EXPIRE_AFTER_SECONDS = int(getattr(
-    settings, 'ACTION_INSTANCE_EXPIRE_SECONDS', 600))
+
+# 预约实例配置来自 device_config.json 的 action 段（与 artifact/lidar 同源）。
+# 每次调用重新读取，改配置后无需重启 web/actor 即可热生效。
+CONFIG_PATH = Path(settings.BASE_DIR) / 'device_config.json'
+DEFAULT_INSTANCE_DIR = 'action_instances'
+DEFAULT_EXPIRE_SECONDS = 600
 
 
 # ---------------------------------------------------------------------------
@@ -451,8 +455,43 @@ def _coerce_form_value(param: dict[str, Any], raw: str) -> tuple[Any, str | None
 # 预约实例
 # ---------------------------------------------------------------------------
 
+def load_action_config() -> dict[str, Any]:
+    """读取 device_config.json 的 action 段。
+
+    action_instance_dir 为相对路径时，按 device_config.json 所在目录解析
+    （即 BASE_DIR）；绝对路径直接使用。字段缺失或非法时回退默认值，
+    避免单点配置错误导致整个预约功能不可用。
+    """
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+
+    section = raw.get('action') if isinstance(raw, dict) else None
+    if not isinstance(section, dict):
+        section = {}
+
+    raw_dir = section.get('action_instance_dir', DEFAULT_INSTANCE_DIR)
+    if not isinstance(raw_dir, str) or not raw_dir.strip():
+        raw_dir = DEFAULT_INSTANCE_DIR
+    instance_dir = Path(raw_dir)
+    if not instance_dir.is_absolute():
+        instance_dir = CONFIG_PATH.parent / instance_dir
+
+    expire = section.get('action_instance_expire_seconds',
+                         DEFAULT_EXPIRE_SECONDS)
+    if isinstance(expire, bool) or not isinstance(expire, int) or expire <= 0:
+        expire = DEFAULT_EXPIRE_SECONDS
+
+    return {'instance_dir': instance_dir, 'expire_seconds': int(expire)}
+
+
+def get_expire_after_seconds() -> int:
+    return load_action_config()['expire_seconds']
+
+
 def _instance_dir() -> Path:
-    directory = Path(settings.ACTION_INSTANCE_DIR)
+    directory = load_action_config()['instance_dir']
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 
@@ -545,7 +584,7 @@ def schedule_action(action_id: str, raw_scheduled_at: str,
         'action_id': action_id,
         'title': action['title'],
         'scheduled_at': iso_utc(scheduled_at),
-        'expire_after_seconds': EXPIRE_AFTER_SECONDS,
+        'expire_after_seconds': get_expire_after_seconds(),
         'status': 'pending',
         'created_at': iso_utc(created_at),
         'started_at': None,
@@ -571,7 +610,8 @@ def list_pending_instances() -> list[dict[str, Any]]:
             created_at = parse_utc(instance['created_at'])
         except (KeyError, TypeError, ValueError):
             continue
-        expire_after = instance.get('expire_after_seconds', EXPIRE_AFTER_SECONDS)
+        expire_after = instance.get('expire_after_seconds',
+                                    get_expire_after_seconds())
         if now - scheduled_at > timedelta(seconds=expire_after):
             continue
         item = dict(instance)
