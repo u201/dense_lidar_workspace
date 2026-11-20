@@ -49,7 +49,23 @@
         {% endfor %}
       {% endfor %}
 
-      <button class="op" type="submit">执行</button>
+      <p>
+        <label>
+          预约时间（UTC+8）
+          <input type="datetime-local" name="scheduled_at" step="1">
+        </label>
+      </p>
+
+      <p class="ops">
+        <button class="op" type="submit">执行</button>
+        <button class="op" type="submit"
+                hx-post="{% url 'action:schedule' action.action_id %}"
+                hx-include="closest form"
+                hx-target="#action-result-{{ action.action_id }}"
+                hx-swap="innerHTML"
+                hx-disabled-elt="this"
+                hx-confirm="确定预约执行 {{ action.title }}？">预约执行</button>
+      </p>
     </form>
   {% endif %}
 
