@@ -33,6 +33,7 @@ INPUT_TZ = timezone(timedelta(hours=8))
 CONFIG_PATH = Path(settings.BASE_DIR) / 'device_config.json'
 DEFAULT_INSTANCE_DIR = 'action_instances'
 DEFAULT_EXPIRE_SECONDS = 600
+DEFAULT_ACTOR_HTTP_PORT = 8
 
 # 单步 delay 上限：防止一个等待把 actor 的调度拖得过长。
 MAX_DELAY_SECONDS = 600
@@ -516,7 +517,16 @@ def load_action_config() -> dict[str, Any]:
     if isinstance(expire, bool) or not isinstance(expire, int) or expire <= 0:
         expire = DEFAULT_EXPIRE_SECONDS
 
-    return {'instance_dir': instance_dir, 'expire_seconds': int(expire)}
+    http_port = section.get('actor_http_port', DEFAULT_ACTOR_HTTP_PORT)
+    if (isinstance(http_port, bool) or not isinstance(http_port, int)
+            or not 1 <= http_port <= 65535):
+        http_port = DEFAULT_ACTOR_HTTP_PORT
+
+    return {
+        'instance_dir': instance_dir,
+        'expire_seconds': int(expire),
+        'http_port': http_port,
+    }
 
 
 def get_expire_after_seconds() -> int:
