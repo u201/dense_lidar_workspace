@@ -1,8 +1,8 @@
 """Action 服务：读取/校验 actions.json，并同步或预约执行 action。
 
-同步执行与预约执行共用 execute_steps，区别只在 steps 的来源：
-- 同步执行：actions.json 模板 + 表单覆盖值，即时解析后执行；
-- 预约执行：解析后的 steps 快照落盘为实例文件，daemon/actor.py 只读快照。
+同步执行与预约执行共用 execute_step，区别只在调度方式：
+- 同步执行：actions.json 模板 + 表单覆盖值，即时解析后一次性执行；
+- 预约执行：解析后的 steps 快照落盘为实例文件，daemon/actor.py 每 tick 推进一步。
 
 页面上的时间输入按固定 UTC+8 解释，实例文件里的时间一律存 UTC。
 """
@@ -33,6 +33,9 @@ INPUT_TZ = timezone(timedelta(hours=8))
 CONFIG_PATH = Path(settings.BASE_DIR) / 'device_config.json'
 DEFAULT_INSTANCE_DIR = 'action_instances'
 DEFAULT_EXPIRE_SECONDS = 600
+
+# 单步 delay 上限：防止一个等待把 actor 的调度拖得过长。
+MAX_DELAY_SECONDS = 600
 
 
 # ---------------------------------------------------------------------------
@@ -153,13 +156,16 @@ def _normalize_step(raw_step: Any, index: int,
                     ) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     if not isinstance(raw_step, dict):
-        return {'command': '', 'args': {}, 'fields': []}, [f'step {index} 必须是对象']
+        return (
+            {'command': '', 'args': {}, 'delay': 0.0, 'fields': []},
+            [f'step {index} 必须是对象'],
+        )
 
     command = raw_step.get('command')
     if not isinstance(command, str) or command not in registry:
         return (
             {'command': command if isinstance(command, str) else '',
-             'args': {}, 'fields': []},
+             'args': {}, 'delay': 0.0, 'fields': []},
             [f'step {index} 引用了未知 command: {command!r}'],
         )
 
@@ -167,7 +173,7 @@ def _normalize_step(raw_step: Any, index: int,
     raw_args = raw_step.get('args', {})
     if not isinstance(raw_args, dict):
         return (
-            {'command': command, 'args': {}, 'fields': []},
+            {'command': command, 'args': {}, 'delay': 0.0, 'fields': []},
             [f'step {index} 的 args 必须是对象'],
         )
 
@@ -196,9 +202,14 @@ def _normalize_step(raw_step: Any, index: int,
         else:
             args[name] = normalized
 
+    delay, delay_error = _validate_delay_value(raw_step.get('delay', 0))
+    if delay_error:
+        errors.append(f'step {index} delay: {delay_error}')
+
     step = {
         'command': command,
         'args': args,
+        'delay': delay,
         'definition': definition,
         'fields': _build_fields(params, args),
     }
@@ -256,6 +267,17 @@ def _build_fields(params: list[dict[str, Any]],
     return fields
 
 
+def _validate_delay_value(value: Any) -> tuple[float, str | None]:
+    """校验 delay：非 bool 的数字，范围 0 ~ MAX_DELAY_SECONDS。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0, 'delay 必须是数字'
+    if value < 0:
+        return 0.0, 'delay 不能为负'
+    if value > MAX_DELAY_SECONDS:
+        return 0.0, f'delay 不能超过 {MAX_DELAY_SECONDS} 秒'
+    return float(value), None
+
+
 def parse_overrides(post: Mapping[str, str]) -> dict[int, dict[str, str]]:
     """把 step_0_mode 形式的表单字段按 step 分组。"""
     overrides: dict[int, dict[str, str]] = {}
@@ -291,7 +313,7 @@ def execute_action(action_id: str,
                             '；'.join(action['errors']))
 
     steps, arg_error = _resolve_steps(action, overrides or {})
-    run = _new_run(action_id)
+    run = new_run(action_id)
     succeeded = _run_steps(steps, run, action_id)
 
     if arg_error and succeeded:
@@ -315,16 +337,12 @@ def execute_action(action_id: str,
 
 def execute_steps(steps: list[dict[str, Any]],
                   action_id: str) -> dict[str, Any]:
-    """执行已解析的步骤快照；同步执行与 actor 共用同一份逻辑。"""
-    run = _new_run(action_id)
+    """同步执行已解析的步骤快照；actor 逐 tick 调用 execute_step。"""
+    run = new_run(action_id)
     succeeded = _run_steps(steps, run, action_id)
     if succeeded and len(run['steps']) == len(steps):
         run['status'] = 'succeeded'
     return _finish_run(run)
-
-
-def execute_instance(instance: dict[str, Any]) -> dict[str, Any]:
-    return execute_steps(instance.get('steps', []), instance['action_id'])
 
 
 def _resolve_steps(action: dict[str, Any],
@@ -343,11 +361,12 @@ def _resolve_steps(action: dict[str, Any],
                 'args': args,
                 'message': '；'.join(errors),
             }
-        steps.append({'command': step['command'], 'args': args})
+        steps.append({'command': step['command'], 'args': args,
+                      'delay': step.get('delay', 0)})
     return steps, None
 
 
-def _new_run(action_id: str) -> dict[str, Any]:
+def new_run(action_id: str) -> dict[str, Any]:
     started_at = datetime.now(timezone.utc)
     return {
         'run_id': f'{action_id}-{started_at:%Y%m%dT%H%M%S%fZ}',
@@ -360,49 +379,63 @@ def _new_run(action_id: str) -> dict[str, Any]:
     }
 
 
+def execute_step(step: dict[str, Any], run: dict[str, Any],
+                 action_id: str) -> dict[str, Any]:
+    """执行一步并返回结果；异常统一转成 error，不向外抛。
+
+    index 由 run 中已完成的步数决定，因此同步执行与 actor 增量执行
+    可以各自循环调用，步骤编号保持一致。
+    """
+    step_run = {
+        'index': len(run['steps']),
+        'command': step['command'],
+        'args': step['args'],
+        'status': 'succeeded',
+        'result': None,
+        'error': None,
+        'duration_ms': 0,
+    }
+    started = time.monotonic()
+    try:
+        definition = get_registry().get(step['command'])
+        if definition is None:
+            raise CommandError('unknown_command',
+                               f'command 已不在注册表: {step["command"]}')
+        step_run['result'] = definition['handler'](
+            step['args'], {'run_id': run['run_id'], 'action_id': action_id})
+    except CommandError as exc:
+        step_run['status'] = 'failed'
+        step_run['error'] = {
+            'code': exc.code,
+            'message': exc.message,
+            'detail': exc.detail,
+        }
+    except Exception as exc:  # 防止单个 command 把请求打成 500
+        step_run['status'] = 'failed'
+        step_run['error'] = {
+            'code': 'internal_error',
+            'message': f'{type(exc).__name__}: {exc}',
+        }
+    step_run['duration_ms'] = round((time.monotonic() - started) * 1000)
+    return step_run
+
+
 def _run_steps(steps: list[dict[str, Any]], run: dict[str, Any],
                action_id: str) -> bool:
-    registry = get_registry()
-    for index, step in enumerate(steps):
-        step_run = {
-            'index': index,
-            'command': step['command'],
-            'args': step['args'],
-            'status': 'succeeded',
-            'result': None,
-            'error': None,
-            'duration_ms': 0,
-        }
-        started = time.monotonic()
-        try:
-            definition = registry.get(step['command'])
-            if definition is None:
-                raise CommandError('unknown_command',
-                                   f'command 已不在注册表: {step["command"]}')
-            step_run['result'] = definition['handler'](
-                step['args'], {'run_id': run['run_id'], 'action_id': action_id})
-        except CommandError as exc:
-            step_run['status'] = 'failed'
-            step_run['error'] = {
-                'code': exc.code,
-                'message': exc.message,
-                'detail': exc.detail,
-            }
-        except Exception as exc:  # 防止单个 command 把请求打成 500
-            step_run['status'] = 'failed'
-            step_run['error'] = {
-                'code': 'internal_error',
-                'message': f'{type(exc).__name__}: {exc}',
-            }
-        step_run['duration_ms'] = round((time.monotonic() - started) * 1000)
+    """同步执行全部步骤；delay 在这里阻塞等待，actor 不走这个函数。"""
+    for step in steps:
+        step_run = execute_step(step, run, action_id)
         run['steps'].append(step_run)
         if step_run['status'] == 'failed':
             return False
+        delay = step.get('delay', 0) or 0
+        if delay > 0:
+            time.sleep(delay)
     return True
 
 
 def _failure_run(action_id: str, code: str, message: str) -> dict[str, Any]:
-    run = _new_run(action_id)
+    run = new_run(action_id)
     run['error'] = {'code': code, 'message': message}
     return _finish_run(run)
 
@@ -550,6 +583,33 @@ def iter_instances(status: str | None = None) -> Iterator[dict[str, Any]]:
         if status is not None and instance.get('status') != status:
             continue
         yield instance
+
+
+def select_due_winner(instances: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """同一 tick 的到点实例中选创建时间最新者；同一时刻用 instance_id 兜底。"""
+    if not instances:
+        return None
+    return max(instances,
+               key=lambda item: (parse_utc(item['created_at']),
+                                 item['instance_id']))
+
+
+def mark_superseded(instance: dict[str, Any],
+                    winner: dict[str, Any]) -> None:
+    """标记被覆盖的预约；重读文件，只有仍为 pending 才写，避免覆盖取消。"""
+    fresh = load_instance(instance['instance_id'])
+    if fresh is None or fresh.get('status') != 'pending':
+        return
+    fresh['status'] = 'superseded'
+    fresh['started_at'] = None
+    fresh['run'] = None
+    fresh['finished_at'] = iso_utc(datetime.now(timezone.utc))
+    fresh['error'] = {
+        'code': 'superseded',
+        'message': (f'被创建时间更晚的到点预约覆盖'
+                    f'（{winner["instance_id"]}），未执行'),
+    }
+    save_instance(fresh)
 
 
 def schedule_action(action_id: str, raw_scheduled_at: str,

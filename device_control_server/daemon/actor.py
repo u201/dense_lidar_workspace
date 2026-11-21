@@ -1,8 +1,9 @@
-"""预约实例执行器（单线程、顺序执行）。
+"""预约实例执行器（单线程、增量执行）。
 
-每秒重扫 pending 实例，按 (scheduled_at, created_at) 排序：
-- 到点且未过期：依次调用 action.service.execute_instance 执行；
-- 超过 scheduled_at 且已过 expire_after_seconds：标记 expired，不执行。
+每秒重扫 pending 实例：
+- 空闲：把过期实例标记 expired；同一 tick 的多个到点实例只执行创建时间
+  最新者，其余标记 superseded；
+- 执行中：每个 tick 最多推进一步；delay 只记录到期时间，不阻塞主循环。
 
 运行方式（在 device_control_server 目录下）：
     ..\\venv\\Scripts\\python.exe -m daemon.actor
@@ -37,6 +38,8 @@ class Actor:
         self.instance_dir = service.load_action_config()['instance_dir']
         self.poll_interval = poll_interval
         self._stop = threading.Event()
+        # 执行上下文：None 表示空闲，否则每 tick 最多推进一步。
+        self.current: dict[str, Any] | None = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -56,26 +59,38 @@ class Actor:
         logger.info('actor stopped')
 
     def tick(self) -> None:
+        if self.current is not None:
+            self._advance()
+            return
+
         now = datetime.now(timezone.utc)
-        entries: list[tuple[tuple[datetime, datetime], dict[str, Any]]] = []
+        due: list[dict[str, Any]] = []
         for instance in service.iter_instances('pending'):
             try:
-                key = (service.parse_utc(instance['scheduled_at']),
-                       service.parse_utc(instance['created_at']))
+                scheduled_at = service.parse_utc(instance['scheduled_at'])
+                service.parse_utc(instance['created_at'])
             except (KeyError, TypeError, ValueError):
                 logger.warning('skip malformed instance: %s',
                                instance.get('instance_id'))
                 continue
-            entries.append((key, instance))
 
-        entries.sort(key=lambda entry: entry[0])
-        for (scheduled_at, _), instance in entries:
             expire_after = instance.get('expire_after_seconds',
                                         service.get_expire_after_seconds())
             if now - scheduled_at > timedelta(seconds=expire_after):
                 self._expire(instance, now, expire_after)
             elif scheduled_at <= now:
-                self._execute(instance)
+                due.append(instance)
+
+        if not due:
+            return
+
+        winner = service.select_due_winner(due)
+        for instance in due:
+            if instance['instance_id'] != winner['instance_id']:
+                service.mark_superseded(instance, winner)
+        self._start(winner, now)
+        if self.current is not None:
+            self._advance()
 
     def _expire(self, instance: dict[str, Any], now: datetime,
                 expire_after: int) -> None:
@@ -89,25 +104,70 @@ class Actor:
         logger.warning('expired %s (scheduled_at=%s)',
                        instance['instance_id'], instance['scheduled_at'])
 
-    def _execute(self, instance: dict[str, Any]) -> None:
-        # 先写 running 占位；异常重启时可据此识别“执行结果未知”。
-        instance['status'] = 'running'
-        instance['started_at'] = service.iso_utc(datetime.now(timezone.utc))
-        service.save_instance(instance)
-        logger.info('executing %s (%s)',
-                    instance['instance_id'], instance['action_id'])
+    def _start(self, instance: dict[str, Any], now: datetime) -> None:
+        # 选中与真正开始之间可能被 web 取消，重读确认仍是 pending。
+        fresh = service.load_instance(instance['instance_id'])
+        if fresh is None or fresh.get('status') != 'pending':
+            logger.warning('skip %s: no longer pending',
+                           instance.get('instance_id'))
+            return
 
-        run = service.execute_instance(instance)
+        # 先写 running 占位；异常重启时可据此识别“执行结果未知”。
+        fresh['status'] = 'running'
+        fresh['started_at'] = service.iso_utc(now)
+        service.save_instance(fresh)
+        self.current = {
+            'instance': fresh,
+            'run': service.new_run(fresh['action_id']),
+            'next_index': 0,
+            'not_before': now,
+        }
+        logger.info('executing %s (%s)',
+                    fresh['instance_id'], fresh['action_id'])
+
+    def _advance(self) -> None:
+        """推进一步；delay 未到期时直接返回，不占用主循环。"""
+        current = self.current
+        now = datetime.now(timezone.utc)
+        if now < current['not_before']:
+            return
+
+        steps = current['instance'].get('steps', [])
+        if current['next_index'] >= len(steps):
+            self._finish('succeeded')
+            return
+
+        step = steps[current['next_index']]
+        step_run = service.execute_step(step, current['run'],
+                                        current['instance']['action_id'])
+        current['run']['steps'].append(step_run)
+        if step_run['status'] == 'failed':
+            self._finish('failed')
+            return
+
+        current['next_index'] += 1
+        delay = step.get('delay', 0) or 0
+        if delay > 0:
+            current['not_before'] = now + timedelta(seconds=delay)
+
+    def _finish(self, status: str) -> None:
+        instance = self.current['instance']
+        run = self.current['run']
+        run['status'] = status
+        run['finished_at'] = datetime.now(timezone.utc).isoformat()
         instance['run'] = run
-        instance['status'] = run['status']
+        instance['status'] = status
         instance['finished_at'] = run['finished_at']
         service.save_instance(instance)
+        self.current = None
 
-        if run['status'] == 'succeeded':
+        if status == 'succeeded':
             logger.info('succeeded %s', instance['instance_id'])
         else:
+            last_error = (run['steps'][-1].get('error')
+                          if run['steps'] else None)
             logger.error('failed %s: %s', instance['instance_id'],
-                         run.get('error') or run['steps'][-1].get('error'))
+                         run.get('error') or last_error)
 
     def _recover_running(self) -> None:
         """上次进程在 executing 中途退出：结果未知，标记 failed 不重试。"""
