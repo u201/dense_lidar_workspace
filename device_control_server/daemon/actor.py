@@ -11,12 +11,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
 import sys
 import threading
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -35,17 +37,22 @@ logger = logging.getLogger('actor')
 
 class Actor:
     def __init__(self, poll_interval: float = 1.0) -> None:
-        self.instance_dir = service.load_action_config()['instance_dir']
+        config = service.load_action_config()
+        self.instance_dir = config['instance_dir']
+        self.http_port = config['http_port']
         self.poll_interval = poll_interval
         self._stop = threading.Event()
         # 执行上下文：None 表示空闲，否则每 tick 最多推进一步。
         self.current: dict[str, Any] | None = None
+        self._http_server: ThreadingHTTPServer | None = None
+        self._http_thread: threading.Thread | None = None
 
     def stop(self) -> None:
         self._stop.set()
 
     def run_forever(self) -> None:
         self.instance_dir.mkdir(parents=True, exist_ok=True)
+        self._start_http()
         self._recover_running()
         logger.info('actor started, instance_dir=%s', self.instance_dir)
 
@@ -56,6 +63,7 @@ class Actor:
                 logger.exception('actor tick failed')
             self._stop.wait(self.poll_interval)
 
+        self._stop_http()
         logger.info('actor stopped')
 
     def tick(self) -> None:
@@ -182,6 +190,73 @@ class Actor:
             service.save_instance(instance)
             logger.warning('recovered running instance %s as failed',
                            instance['instance_id'])
+
+    def snapshot(self) -> dict[str, Any]:
+        """当前执行状态快照。
+
+        HTTP 线程直接读取，不加锁：引用赋值是原子的，仅接受
+        _advance 原地修改带来的极小概率中间态。
+        """
+        current = self.current
+        if current is None:
+            return {'running': False}
+        instance = current['instance']
+        return {
+            'running': True,
+            'instance_id': instance['instance_id'],
+            'action_id': instance['action_id'],
+            'status': instance['status'],
+            'next_index': current['next_index'],
+            'total_steps': len(instance.get('steps', [])),
+            'not_before': current['not_before'].isoformat(),
+            'run': current['run'],
+        }
+
+    def _start_http(self) -> None:
+        handler = type('StatusHandler', (_StatusHandler,), {'actor': self})
+        try:
+            self._http_server = ThreadingHTTPServer(
+                ('127.0.0.1', self.http_port), handler)
+        except OSError:
+            # 状态接口是附加能力，端口被占不应拖垮执行器。
+            logger.exception('http status disabled: cannot bind port %s',
+                             self.http_port)
+            return
+        self._http_thread = threading.Thread(
+            target=self._http_server.serve_forever,
+            name='actor-http', daemon=True)
+        self._http_thread.start()
+        logger.info('http status on http://127.0.0.1:%s/current',
+                    self.http_port)
+
+    def _stop_http(self) -> None:
+        if self._http_server is not None:
+            self._http_server.shutdown()
+            self._http_server.server_close()
+            self._http_server = None
+        if self._http_thread is not None:
+            self._http_thread.join(timeout=5)
+            self._http_thread = None
+
+
+class _StatusHandler(BaseHTTPRequestHandler):
+    """GET /current 返回 actor.snapshot()；实例由 _start_http 注入。"""
+
+    actor: Actor
+
+    def do_GET(self) -> None:
+        if self.path != '/current':
+            self.send_error(404)
+            return
+        body = json.dumps(self.actor.snapshot(), ensure_ascii=False).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        logger.debug('http: ' + format, *args)
 
 
 def main() -> int:
