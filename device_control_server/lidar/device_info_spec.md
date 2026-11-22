@@ -5,7 +5,6 @@
 在 Lidar Web 卡片中实时查询并展示设备的以下信息：
 
 - `SN`：设备序列号
-- `ProdName`：产品名称
 - 待机模式（Standby Mode）
 - 转速（Spin Rate，rpm）
 
@@ -54,16 +53,15 @@
 
 1. service 层：泛化 CGI 请求；提供 `get_device_info()`、`get_standby_mode()` / `set_standby_mode()`、`get_spin_rate()` / `set_spin_rate()`。
 2. 视图层：以 `device_info` 为探活构造一次“设备快照”，探活失败短路，探活成功后顺序请求 standby 与转速，单字段失败只降级自身。
-3. 模板：展示 `ProdName`、`SN`、待机模式、转速；失败的字段不渲染。
+3. 模板：展示 `SN`、待机模式、转速；失败的字段不渲染。
 4. 命令层：新增 `lidar.spin` 命令（设置转速），取值限定 300 / 600 / 1200。
 5. 覆盖 service / 视图 / 模板 / 命令的测试。
 
 ### 3.2 不包含
 
-- 不展示或处理 `Body` 中除本期字段外的其他字段（`Model`、`SW_Ver`、`Mac` 等）。
+- 不展示或处理 `Body` 中除 `SN` 外的其他字段（`ProdName`、`Model`、`SW_Ver`、`Mac` 等）。
 - 不新增 URL、配置项、数据库模型、前端框架、第三方依赖。
 - 不增加自动轮询、缓存、后台线程或常驻任务；不并发请求设备。
-- 不做 `ProdName` 到展示名的映射（如 `PandarQT→PandarQT-64`），页面显示设备返回的原始值。
 - 不引入型号 capability 判定；不处理非 XT 设备的功能差异。
 - 不在本规格内引入除 `standby`、`spin_speed` 外的其他可设置项。
 
@@ -77,7 +75,7 @@
     'status_label': '在线' | '离线' | '设备异常' | '配置错误',
     'device': 'host:port' | None,
     'detail': '<错误详情字符串>' | None,
-    'device_info': {'SN': '...', 'ProdName': '...'} | None,
+    'device_info': {'SN': '...'} | None,
     'mode': 0 | 1 | None,
     'mode_label': '运行 In Operation' | '待机 Standby' | None,
     'spin': {'index': 1 | 2 | 3, 'rpm': 300 | 600 | 1200} | None,
@@ -93,7 +91,7 @@
 一次成功刷新按以下顺序**串行**发出请求：
 
 1. `load_config()` —— 失败即返回 `config_error`，**不发任何设备请求**。
-2. `get_device_info()` —— **探活**；成功后得到 `SN` / `ProdName`。
+2. `get_device_info()` —— **探活**；成功后得到 `SN`。
 3. `get_standby_mode()`。
 4. `get_spin_rate()`（请求 `lidar_config`，读取 `SpinSpeed`）。
 
@@ -136,8 +134,8 @@ get_device_info(cfg=None) -> dict[str, str]
 ```
 
 - 请求：`GET /pandar.cgi?action=get&object=device_info`，无 `key`/`value`，无 body。
-- 校验：复用 HTTP/JSON/顶层校验与 `_check_error_code()`（`str(ErrorCode) == '0'`）；`Body` 必须为字典；`SN`、`ProdName` 必须存在且为非空白字符串。
-- 成功仅返回 `{'SN', 'ProdName'}`，丢弃 `Body` 其他字段；任一校验失败整体失败。
+- 校验：复用 HTTP/JSON/顶层校验与 `_check_error_code()`（`str(ErrorCode) == '0'`）；`Body` 必须为字典；`SN` 必须存在且为非空白字符串。
+- 成功仅返回 `{'SN'}`，丢弃 `Body` 其他字段；任一校验失败整体失败。
 - 异常：配置 `LidarConfigError`；网络/超时/非 200 `LidarUnreachableError`；结构/字段/ErrorCode 非法 `LidarResponseError`，错误消息以“查询设备信息”标识。
 
 ### 6.4 待机模式
@@ -208,8 +206,7 @@ handler 行为：
 | --- | --- | --- |
 | 状态横幅 | `status_label`、`status` | 始终 |
 | 设备地址 | `device` | `device` 存在；否则显示“（未配置设备地址）” |
-| 产品名称 | `device_info.ProdName` | `device_info` 存在 |
-| 序列号 | `device_info.SN` | `device_info` 存在 |
+| 产品序列号 | `device_info.SN` | `device_info` 存在 |
 | 待机模式 | `mode`、`mode_label` | `mode` 非空 |
 | 转速 | `spin.rpm` | `spin` 非空 |
 | 错误详情横幅 | `detail` | `detail` 非空（即使 `status` 为 ok 也显示） |
@@ -238,7 +235,7 @@ handler 行为：
 | `lidar/service.py` | 泛化 `_request`；新增 `get_device_info`、`get_spin_rate`/`set_spin_rate`；重写或调整 standby 实现以复用泛化请求 |
 | `lidar/views.py` | 按设备快照重写 `_status_context()`：探活在前、探活失败短路、字段级降级 |
 | `lidar/commands.py` | 新增 `lidar.spin` 命令与 handler |
-| `lidar/templates/lidar/_card_body.html` | 增加 `ProdName`、`SN`、转速行，每行独立守卫；`detail` 横幅在 ok 时也展示 |
+| `lidar/templates/lidar/_card_body.html` | 增加 `SN`、转速行，每行独立守卫；`detail` 横幅在 ok 时也展示 |
 | `lidar/tests.py` | 增加 service / 视图 / 模板 / 命令测试 |
 
 原则上无需修改：`lidar/urls.py`、`lidar/apps.py`、`lidar/models.py`、`lidar/index.html`、`lidar/_card.html`、`device_config.json`、`config/urls.py`、`config/settings.py`、`action/` 模块。
@@ -249,7 +246,7 @@ handler 行为：
 
 ### 10.1 Service 测试
 
-1. `get_device_info` 成功仅返回 `SN`、`ProdName`；URL 精确为 `action=get&object=device_info`，无 `key`/`value`，使用配置的 host/port/timeout，方法 GET。
+1. `get_device_info` 成功仅返回 `SN`；URL 精确为 `action=get&object=device_info`，无 `key`/`value`，使用配置的 host/port/timeout，方法 GET。
 2. `get_device_info`：ErrorCode 非 0 / 非 200 / 连接失败 / 超时 / 非 JSON / 顶层非字典 / `Body` 非字典 / 字段缺失或空白 → 对应异常。
 3. `get_spin_rate`：`SpinSpeed` 为整数 `2` 和字符串 `'2'` 都映射为正确 index/rpm；缺失、`bool`、无法转整数或不在映射中（含 `4`）→ `LidarResponseError`；URL 为 `action=get&object=lidar_config`。
 4. `set_spin_rate`：rpm 反查 index，URL 为 `set&object=lidar&key=spin_speed&value={index}`，方法 POST；rpm 不在 {300,600,1200} → `LidarArgumentError`。
@@ -257,7 +254,7 @@ handler 行为：
 
 ### 10.2 View / 模板测试
 
-1. 全部成功：显示在线、设备地址、`ProdName`、`SN`、待机模式、转速。
+1. 全部成功：显示在线、设备地址、`SN`、待机模式、转速。
 2. 探活不可达 → 显示“离线”与详情，**且断言 standby / spin 未被调用**（短路），不展示任何字段。
 3. 探活响应非法 → 显示“设备异常”，同样不请求后续字段。
 4. 探活成功但 standby 请求失败：卡片仍“在线”，待机行不渲染，`detail` 显示错误，`device_info` 仍显示；继续请求 spin（若成功则转速正常显示）。
@@ -274,7 +271,7 @@ handler 行为：
 
 ## 11. 验收标准
 
-1. 正常设备下，卡片准确显示 `SN`、`ProdName` 原值、待机模式、转速 rpm。
+1. 正常设备下，卡片准确显示 `SN` 原值、待机模式、转速 rpm。
 2. 探活失败时卡片显示离线/设备异常与详情，且不发起 standby / spin 请求。
 3. standby / spin 单字段请求失败只影响该字段并给出详情，不抹掉其他字段，卡片仍“在线”。
 4. 首屏、手动刷新、`lidar-refresh` 均实时获取并更新；不出现陈旧或部分拼接的值。
