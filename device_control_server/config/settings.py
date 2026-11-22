@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     'artifact',
     'lidar',
     'action',
+    'recorder',
 ]
 
 MIDDLEWARE = [
