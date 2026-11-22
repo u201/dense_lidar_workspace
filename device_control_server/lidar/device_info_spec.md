@@ -31,7 +31,9 @@
 | 转速查询 | `loadStatus()` | `GET /pandar.cgi?action=get&object=lidar_config`（读取 `Body.SpinSpeed`） |
 | 转速设置 | `saveSetting()` | `POST /pandar.cgi?action=set&object=lidar&key=spin_speed&value={index}` |
 
-`SpinSpeed` 是索引值，显示用 rpm：`rpm = 2^(index-1) × 300`。本规格支持的取值为 `1→300`、`2→600`、`3→1200`；`SpinSpeed=4`（2400 rpm）参考 UI 未提供，遇到按非法处理，是否真实存在需真机确认（见第 11 节）。
+`SpinSpeed` 是索引值，显示用 rpm：`rpm = 2^(index-1) × 300`。本规格支持的取值为 `1→300`、`2→600`、`3→1200`；`SpinSpeed=4`（2400 rpm）参考 UI 未提供，**同 Pandar Console 不支持**，遇到按非法处理。
+
+真机实测 `Body.SpinSpeed` 以字符串形式返回（如 `"2"`），与 `standbymode` 返回 `'0'`/`'1'` 同型；`get_spin_rate()` 需兼容字符串与整数两种形态（`request-pandar/lidar_config.py` 已用 `int(spin)` 处理）。
 
 参考页对 XT 系列保留 300 rpm 选项（仅非 XT 型号会删除该选项，见 `pandar.js` 734–737 行），与本前提一致。
 
@@ -156,7 +158,7 @@ get_spin_rate(cfg=None) -> dict   # {'index': int, 'rpm': int}
 set_spin_rate(rpm: int, cfg=None) -> None
 ```
 
-- `get`：`GET /pandar.cgi?action=get&object=lidar_config`，读取 `Body.SpinSpeed`，按 `SPIN_INDEX_TO_RPM` 转 rpm；`SpinSpeed` 缺失、非整数、不在已知映射中 → `LidarResponseError`。
+- `get`：`GET /pandar.cgi?action=get&object=lidar_config`，读取 `Body.SpinSpeed`，按 `SPIN_INDEX_TO_RPM` 转 rpm；真机返回可能是字符串 `'1'`/`'2'`/`'3'` 或整数，统一用 `int()` 归一化后查表；`SpinSpeed` 缺失、`bool`、无法转整数或转后不在已知映射中（含 `4`）→ `LidarResponseError`。
 - `set`：`POST /pandar.cgi?action=set&object=lidar&key=spin_speed&value={index}`，其中 `index` 由 `rpm` 反查；`rpm` 不在 `SPIN_RPMS` 中 → `LidarArgumentError`。
 - 异常映射与 device_info 一致，错误消息分别以“查询转速”“设置转速”标识。
 
@@ -249,7 +251,7 @@ handler 行为：
 
 1. `get_device_info` 成功仅返回 `SN`、`ProdName`；URL 精确为 `action=get&object=device_info`，无 `key`/`value`，使用配置的 host/port/timeout，方法 GET。
 2. `get_device_info`：ErrorCode 非 0 / 非 200 / 连接失败 / 超时 / 非 JSON / 顶层非字典 / `Body` 非字典 / 字段缺失或空白 → 对应异常。
-3. `get_spin_rate`：`SpinSpeed` 映射为正确 index/rpm；缺失/非整数/未知值（含 4）→ `LidarResponseError`；URL 为 `action=get&object=lidar_config`。
+3. `get_spin_rate`：`SpinSpeed` 为整数 `2` 和字符串 `'2'` 都映射为正确 index/rpm；缺失、`bool`、无法转整数或不在映射中（含 `4`）→ `LidarResponseError`；URL 为 `action=get&object=lidar_config`。
 4. `set_spin_rate`：rpm 反查 index，URL 为 `set&object=lidar&key=spin_speed&value={index}`，方法 POST；rpm 不在 {300,600,1200} → `LidarArgumentError`。
 5. standby get/set 请求行为与现有实现一致，不回归（字段类型兼容字符串 `'0'`/`'1'`）。
 
@@ -279,8 +281,3 @@ handler 行为：
 5. `lidar.spin` 能在 300 / 600 / 1200 中设置转速，非法取值被明确拒绝；`lidar.standby` 行为无回归。
 6. 请求严格符合各 object/key/value 约定，复用现有配置与超时；不新增 URL、配置、依赖、缓存、数据库或自动轮询。
 7. 不展示 `Body` 中未要求的其他字段，模板输出经过转义。
-
-## 12. 待确认项
-
-1. 是否真实存在 `SpinSpeed=4`（2400 rpm）：参考 `loadStatus` 公式可推出，但 UI 未提供该选项；需真机确认。本期按非法处理。
-2. 真机在 `lidar_config` 无 `SpinSpeed` 字段、或待机时 `SpinSpeed` 的返回值，需确认以验证异常映射与降级行为。
