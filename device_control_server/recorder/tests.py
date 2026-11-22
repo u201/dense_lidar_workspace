@@ -12,7 +12,7 @@ from django.test import Client, SimpleTestCase
 from django.urls import reverse
 
 from daemon import recorder as recorder_daemon
-from recorder import calibration, client, commands
+from recorder import calibration, commands, service
 
 ACTION_CONTEXT = {
     'kind': 'immediate',
@@ -40,7 +40,7 @@ RECORDER_CONFIG = {
 }
 
 RECORDER_SECTION = {
-    client.platform_interface_key(): 'WLAN 2',
+    service.platform_interface_key(): 'WLAN 2',
     'udp_port': 2368,
     'port': 6,
     'device_ip': '127.0.0.1',
@@ -138,7 +138,7 @@ class CalibrationTests(SimpleTestCase):
 
 
 # ---------------------------------------------------------------------------
-# client 配置与 HTTP
+# service 配置与 HTTP
 # ---------------------------------------------------------------------------
 
 class RecorderConfigTests(SimpleTestCase):
@@ -146,7 +146,7 @@ class RecorderConfigTests(SimpleTestCase):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / 'device_config.json'
             path.write_text(json.dumps({'recorder': section}), encoding='utf-8')
-            return client.load_config(path)
+            return service.load_config(path)
 
     def test_valid_config(self):
         cfg = self._load(dict(RECORDER_SECTION))
@@ -155,56 +155,56 @@ class RecorderConfigTests(SimpleTestCase):
 
     def test_non_loopback_device_ip_rejected(self):
         section = dict(RECORDER_SECTION, device_ip='192.168.0.1')
-        with self.assertRaises(client.RecorderConfigError):
+        with self.assertRaises(service.RecorderConfigError):
             self._load(section)
 
     def test_non_loopback_hostname_rejected(self):
         section = dict(RECORDER_SECTION, device_ip='localhost')
-        with self.assertRaises(client.RecorderConfigError):
+        with self.assertRaises(service.RecorderConfigError):
             self._load(section)
 
     def test_missing_interface_rejected(self):
         section = dict(RECORDER_SECTION)
-        section[client.platform_interface_key()] = '  '
-        with self.assertRaises(client.RecorderConfigError):
+        section[service.platform_interface_key()] = '  '
+        with self.assertRaises(service.RecorderConfigError):
             self._load(section)
 
     def test_invalid_ports_rejected(self):
         for key, value in (('udp_port', True), ('udp_port', 0),
                            ('port', 70000)):
             with self.subTest(key=key, value=value):
-                with self.assertRaises(client.RecorderConfigError):
+                with self.assertRaises(service.RecorderConfigError):
                     self._load(dict(RECORDER_SECTION, **{key: value}))
 
 
-class ClientTests(SimpleTestCase):
+class ServiceTests(SimpleTestCase):
     def test_recording_pcap_when_recording(self):
-        with patch.object(client, 'load_config', return_value=RECORDER_CONFIG), \
-                patch.object(client, 'status',
+        with patch.object(service, 'load_config', return_value=RECORDER_CONFIG), \
+                patch.object(service, 'status',
                              return_value={'status': 'recording',
                                            'pcap_file': 'a.pcap'}):
-            self.assertEqual(client.recording_pcap(), 'a.pcap')
+            self.assertEqual(service.recording_pcap(), 'a.pcap')
 
     def test_recording_pcap_when_idle(self):
-        with patch.object(client, 'load_config', return_value=RECORDER_CONFIG), \
-                patch.object(client, 'status',
+        with patch.object(service, 'load_config', return_value=RECORDER_CONFIG), \
+                patch.object(service, 'status',
                              return_value={'status': 'idle',
                                            'pcap_file': None}):
-            self.assertIsNone(client.recording_pcap())
+            self.assertIsNone(service.recording_pcap())
 
     def test_recording_pcap_when_unreachable(self):
-        with patch.object(client, 'load_config', return_value=RECORDER_CONFIG), \
-                patch.object(client, 'status',
-                             side_effect=client.RecorderUnreachableError('x')):
-            self.assertIsNone(client.recording_pcap())
+        with patch.object(service, 'load_config', return_value=RECORDER_CONFIG), \
+                patch.object(service, 'status',
+                             side_effect=service.RecorderUnreachableError('x')):
+            self.assertIsNone(service.recording_pcap())
 
     def test_record_raises_daemon_error(self):
-        with patch.object(client, 'load_config', return_value=RECORDER_CONFIG), \
-                patch.object(client, '_request_json',
-                             side_effect=client.RecorderError(
+        with patch.object(service, 'load_config', return_value=RECORDER_CONFIG), \
+                patch.object(service, '_request_json',
+                             side_effect=service.RecorderError(
                                  'recorder_busy', 'busy')):
-            with self.assertRaises(client.RecorderError) as ctx:
-                client.record(10, ACTION_CONTEXT)
+            with self.assertRaises(service.RecorderError) as ctx:
+                service.record(10, ACTION_CONTEXT)
         self.assertEqual(ctx.exception.code, 'recorder_busy')
 
 
@@ -228,14 +228,14 @@ class DaemonPreflightTests(SimpleTestCase):
                 self.assertEqual(ctx.exception.code, 'invalid_action_context')
 
     def test_config_invalid(self):
-        with patch.object(recorder_daemon.client, 'load_config',
-                          side_effect=client.RecorderConfigError('bad')):
+        with patch.object(recorder_daemon.recorder_service, 'load_config',
+                          side_effect=service.RecorderConfigError('bad')):
             with self.assertRaises(recorder_daemon.RecorderRequestError) as ctx:
                 recorder_daemon.preflight(10, ACTION_CONTEXT)
         self.assertEqual(ctx.exception.code, 'config_invalid')
 
     def test_artifact_unavailable(self):
-        with patch.object(recorder_daemon.client, 'load_config',
+        with patch.object(recorder_daemon.recorder_service, 'load_config',
                           return_value=RECORDER_CONFIG), \
                 patch.object(recorder_daemon, 'resolve_capture_tool',
                              return_value='dumpcap'), \
@@ -247,7 +247,7 @@ class DaemonPreflightTests(SimpleTestCase):
         self.assertEqual(ctx.exception.code, 'artifact_unavailable')
 
     def test_calibration_invalid(self):
-        with patch.object(recorder_daemon.client, 'load_config',
+        with patch.object(recorder_daemon.recorder_service, 'load_config',
                           return_value=RECORDER_CONFIG), \
                 patch.object(recorder_daemon, 'resolve_capture_tool',
                              return_value='dumpcap'), \
@@ -260,7 +260,7 @@ class DaemonPreflightTests(SimpleTestCase):
         self.assertEqual(ctx.exception.code, 'calibration_invalid')
 
     def test_lidar_standby_prevents_capture(self):
-        with patch.object(recorder_daemon.client, 'load_config',
+        with patch.object(recorder_daemon.recorder_service, 'load_config',
                           return_value=RECORDER_CONFIG), \
                 patch.object(recorder_daemon, 'resolve_capture_tool',
                              return_value='dumpcap'), \
@@ -278,7 +278,7 @@ class DaemonPreflightTests(SimpleTestCase):
         popen.assert_not_called()
 
     def test_valid_preflight_returns_context(self):
-        with patch.object(recorder_daemon.client, 'load_config',
+        with patch.object(recorder_daemon.recorder_service, 'load_config',
                           return_value=RECORDER_CONFIG), \
                 patch.object(recorder_daemon, 'resolve_capture_tool',
                              return_value='dumpcap'), \
@@ -538,9 +538,9 @@ class RecorderCommandTests(SimpleTestCase):
         }
 
     def test_success_returns_record_fields(self):
-        with patch.object(commands.client, 'load_config',
+        with patch.object(commands.service, 'load_config',
                           return_value=RECORDER_CONFIG), \
-                patch.object(commands.client, 'record',
+                patch.object(commands.service, 'record',
                              return_value=SIDECAR) as record:
             result = commands.record({'duration': 10}, self._ctx())
 
@@ -552,9 +552,9 @@ class RecorderCommandTests(SimpleTestCase):
         self.assertEqual(record.call_args.kwargs['timeout'], 40)
 
     def test_missing_action_context_rejected(self):
-        with patch.object(commands.client, 'load_config',
+        with patch.object(commands.service, 'load_config',
                           return_value=RECORDER_CONFIG), \
-                patch.object(commands.client, 'record') as record:
+                patch.object(commands.service, 'record') as record:
             with self.assertRaises(commands.CommandError) as ctx:
                 commands.record({'duration': 10},
                                 {'run_id': 'run', 'action_id': 'x'})
@@ -574,20 +574,20 @@ class RecorderCommandTests(SimpleTestCase):
         }
         for daemon_code, command_code in mapping.items():
             with self.subTest(daemon_code=daemon_code):
-                with patch.object(commands.client, 'load_config',
+                with patch.object(commands.service, 'load_config',
                                   return_value=RECORDER_CONFIG), \
-                        patch.object(commands.client, 'record',
-                                     side_effect=client.RecorderError(
+                        patch.object(commands.service, 'record',
+                                     side_effect=service.RecorderError(
                                          daemon_code, 'x')):
                     with self.assertRaises(commands.CommandError) as ctx:
                         commands.record({'duration': 10}, self._ctx())
                 self.assertEqual(ctx.exception.code, command_code)
 
     def test_unreachable_maps_to_recorder_unreachable(self):
-        with patch.object(commands.client, 'load_config',
+        with patch.object(commands.service, 'load_config',
                           return_value=RECORDER_CONFIG), \
-                patch.object(commands.client, 'record',
-                             side_effect=client.RecorderUnreachableError('x')):
+                patch.object(commands.service, 'record',
+                             side_effect=service.RecorderUnreachableError('x')):
             with self.assertRaises(commands.CommandError) as ctx:
                 commands.record({'duration': 10}, self._ctx())
         self.assertEqual(ctx.exception.code, 'recorder_unreachable')
@@ -595,9 +595,9 @@ class RecorderCommandTests(SimpleTestCase):
     def test_failed_sidecar_raises(self):
         failed = dict(SIDECAR, status='failed',
                       error={'code': 'capture_failed', 'message': 'boom'})
-        with patch.object(commands.client, 'load_config',
+        with patch.object(commands.service, 'load_config',
                           return_value=RECORDER_CONFIG), \
-                patch.object(commands.client, 'record', return_value=failed):
+                patch.object(commands.service, 'record', return_value=failed):
             with self.assertRaises(commands.CommandError) as ctx:
                 commands.record({'duration': 10}, self._ctx())
         self.assertEqual(ctx.exception.code, 'capture_failed')
@@ -631,14 +631,14 @@ class RecorderViewTests(SimpleTestCase):
                       'arm_meter': 0.12,
                       'calibrated_at': '2026-11-20T02:00:00Z',
                   }, 'mtime': 'm', 'sha256': 's'}),
-            patch('recorder.views.client.load_config',
+            patch('recorder.views.service.load_config',
                   return_value=RECORDER_CONFIG),
         ]
         if status_error is not None:
-            stack.append(patch('recorder.views.client.status',
+            stack.append(patch('recorder.views.service.status',
                                side_effect=status_error))
         else:
-            stack.append(patch('recorder.views.client.status',
+            stack.append(patch('recorder.views.service.status',
                                return_value=status_result or {
                                    'status': 'idle'}))
         return stack
@@ -662,7 +662,7 @@ class RecorderViewTests(SimpleTestCase):
         self.assertNotIn('删除', body)
 
     def test_index_offline(self):
-        stack = self._patches(status_error=client.RecorderUnreachableError('down'))
+        stack = self._patches(status_error=service.RecorderUnreachableError('down'))
         for item in stack:
             item.start()
         try:
@@ -702,8 +702,8 @@ class RecorderViewTests(SimpleTestCase):
             patch('recorder.views.calibration.load_calibration',
                   return_value={'values': {'alpha1_degrees': 1.5},
                                 'mtime': 'm', 'sha256': 's'}),
-            patch('recorder.views.client.load_config',
-                  side_effect=client.RecorderConfigError('bad config')),
+            patch('recorder.views.service.load_config',
+                  side_effect=service.RecorderConfigError('bad config')),
         ]
         for item in stack:
             item.start()
@@ -743,7 +743,7 @@ class ArtifactDeleteProtectionTests(SimpleTestCase):
             path = Path(raw) / 'record-1.pcap'
             path.write_bytes(b'data')
             with patch.object(artifact_service, 'resolve_file', return_value=path), \
-                    patch('recorder.client.recording_pcap',
+                    patch('recorder.service.recording_pcap',
                           return_value='record-1.pcap'):
                 error = artifact_service.delete_file('record-1.pcap')
 
@@ -757,7 +757,7 @@ class ArtifactDeleteProtectionTests(SimpleTestCase):
             path = Path(raw) / 'record-1.pcap'
             path.write_bytes(b'data')
             with patch.object(artifact_service, 'resolve_file', return_value=path), \
-                    patch('recorder.client.recording_pcap', return_value=None):
+                    patch('recorder.service.recording_pcap', return_value=None):
                 error = artifact_service.delete_file('record-1.pcap')
 
             self.assertIsNone(error)
