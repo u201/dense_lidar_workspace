@@ -146,8 +146,17 @@ class Actor:
             return
 
         step = steps[current['next_index']]
+        instance = current['instance']
+        execution = {
+            'kind': 'scheduled',
+            'instance_id': instance['instance_id'],
+            'title': instance.get('title') or instance['action_id'],
+            'scheduled_at': instance.get('scheduled_at'),
+            'steps': steps,
+        }
         step_run = service.execute_step(step, current['run'],
-                                        current['instance']['action_id'])
+                                        instance['action_id'],
+                                        execution=execution)
         current['run']['steps'].append(step_run)
         if step_run['status'] == 'failed':
             self._finish('failed')
