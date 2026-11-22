@@ -314,7 +314,14 @@ def execute_action(action_id: str,
 
     steps, arg_error = _resolve_steps(action, overrides or {})
     run = new_run(action_id)
-    succeeded = _run_steps(steps, run, action_id)
+    execution = {
+        'kind': 'immediate',
+        'instance_id': None,
+        'title': action['title'],
+        'scheduled_at': None,
+        'steps': steps,
+    }
+    succeeded = _run_steps(steps, run, action_id, execution)
 
     if arg_error and succeeded:
         # 参数出错的步骤之前都执行成功，把该步骤补记为失败，便于页面定位。
@@ -336,10 +343,12 @@ def execute_action(action_id: str,
 
 
 def execute_steps(steps: list[dict[str, Any]],
-                  action_id: str) -> dict[str, Any]:
+                  action_id: str,
+                  execution: dict[str, Any] | None = None
+                  ) -> dict[str, Any]:
     """同步执行已解析的步骤快照；actor 逐 tick 调用 execute_step。"""
     run = new_run(action_id)
-    succeeded = _run_steps(steps, run, action_id)
+    succeeded = _run_steps(steps, run, action_id, execution)
     if succeeded and len(run['steps']) == len(steps):
         run['status'] = 'succeeded'
     return _finish_run(run)
@@ -380,14 +389,20 @@ def new_run(action_id: str) -> dict[str, Any]:
 
 
 def execute_step(step: dict[str, Any], run: dict[str, Any],
-                 action_id: str) -> dict[str, Any]:
+                 action_id: str,
+                 execution: dict[str, Any] | None = None
+                 ) -> dict[str, Any]:
     """执行一步并返回结果；异常统一转成 error，不向外抛。
 
     index 由 run 中已完成的步数决定，因此同步执行与 actor 增量执行
     可以各自循环调用，步骤编号保持一致。
+
+    execution 为执行身份（kind / instance_id / title / scheduled_at /
+    已解析 steps）；不传时退化为旧的 {'run_id', 'action_id'} 上下文。
     """
+    step_index = len(run['steps'])
     step_run = {
-        'index': len(run['steps']),
+        'index': step_index,
         'command': step['command'],
         'args': step['args'],
         'status': 'succeeded',
@@ -402,7 +417,8 @@ def execute_step(step: dict[str, Any], run: dict[str, Any],
             raise CommandError('unknown_command',
                                f'command 已不在注册表: {step["command"]}')
         step_run['result'] = definition['handler'](
-            step['args'], {'run_id': run['run_id'], 'action_id': action_id})
+            step['args'],
+            _build_step_context(step_index, run, action_id, execution))
     except CommandError as exc:
         step_run['status'] = 'failed'
         step_run['error'] = {
@@ -420,11 +436,52 @@ def execute_step(step: dict[str, Any], run: dict[str, Any],
     return step_run
 
 
+def _build_step_context(step_index: int, run: dict[str, Any],
+                        action_id: str,
+                        execution: dict[str, Any] | None) -> dict[str, Any]:
+    """构造传给 command handler 的上下文。
+
+    action 快照里的 steps 是已解析值（含表单覆盖），step_index 在 handler
+    执行前确定，不能用 handler 返回后的 run['steps'] 反推。
+    """
+    if execution is None:
+        return {'run_id': run['run_id'], 'action_id': action_id}
+
+    steps = execution.get('steps') or []
+    step_count = len(steps)
+    return {
+        'run_id': run['run_id'],
+        'action_id': action_id,
+        'step_index': step_index,
+        'step_count': step_count,
+        'action': {
+            'kind': execution.get('kind', 'immediate'),
+            'instance_id': execution.get('instance_id'),
+            'run_id': run['run_id'],
+            'action_id': action_id,
+            'title': execution.get('title') or action_id,
+            'scheduled_at': execution.get('scheduled_at'),
+            'started_at': run['started_at'].replace('+00:00', 'Z'),
+            'step_index': step_index,
+            'step_count': step_count,
+            'steps': [
+                {
+                    'command': step.get('command'),
+                    'args': step.get('args', {}),
+                    'delay': step.get('delay', 0),
+                }
+                for step in steps
+            ],
+        },
+    }
+
+
 def _run_steps(steps: list[dict[str, Any]], run: dict[str, Any],
-               action_id: str) -> bool:
+               action_id: str,
+               execution: dict[str, Any] | None = None) -> bool:
     """同步执行全部步骤；delay 在这里阻塞等待，actor 不走这个函数。"""
     for step in steps:
-        step_run = execute_step(step, run, action_id)
+        step_run = execute_step(step, run, action_id, execution)
         run['steps'].append(step_run)
         if step_run['status'] == 'failed':
             return False
