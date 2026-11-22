@@ -23,6 +23,11 @@ MODE_IN_OPERATION = 0
 MODE_STANDBY = 1
 MODE_LABELS = {MODE_IN_OPERATION: 'in_operation', MODE_STANDBY: 'standby'}
 
+# 转速：设备侧 SpinSpeed 是索引，页面按 rpm 展示
+SPIN_INDEX_TO_RPM = {1: 300, 2: 600, 3: 1200}
+RPM_TO_SPIN_INDEX = {rpm: index for index, rpm in SPIN_INDEX_TO_RPM.items()}
+SPIN_RPMS = set(RPM_TO_SPIN_INDEX)
+
 
 class LidarError(Exception):
     """驱动层异常基类，调用方按子类区分处理。"""
@@ -79,15 +84,14 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
     return {'host': host.strip(), 'port': port, 'timeout': float(timeout)}
 
 
-def _request(cfg: dict[str, Any] | None, action: str,
-             value: int | None = None) -> dict[str, Any]:
-    """向 pandar.cgi 发请求并返回解析后的 JSON。"""
+def _request(cfg: dict[str, Any] | None, query: str) -> dict[str, Any]:
+    """向 pandar.cgi 发请求并返回解析后的 JSON。
+
+    query 为完整 query string；action=set 时以空 body 发 POST，其余为 GET。
+    """
     cfg = cfg if cfg is not None else load_config()
-    query = f'action={action}&object=lidar_data&key=standbymode'
-    if value is not None:
-        query += f'&value={value}'
     url = f'http://{cfg["host"]}:{cfg["port"]}/pandar.cgi?{query}'
-    data = b'' if action == 'set' else None
+    data = b'' if query.startswith('action=set') else None
     request = urllib.request.Request(url, data=data)
 
     try:
@@ -125,9 +129,25 @@ def _check_error_code(parsed: dict[str, Any], action_label: str) -> None:
                                  body=parsed)
 
 
+def get_device_info(cfg: dict[str, Any] | None = None) -> dict[str, str]:
+    """查询设备信息，成功仅返回 {'SN': ...}。"""
+    parsed = _request(cfg, 'action=get&object=device_info')
+    _check_error_code(parsed, '查询设备信息')
+
+    body = parsed.get('Body')
+    if not isinstance(body, dict):
+        raise LidarResponseError('设备信息响应缺少 Body',
+                                 body=parsed)
+    sn = body.get('SN')
+    if not isinstance(sn, str) or not sn.strip():
+        raise LidarResponseError(f'设备返回 SN 非法: {sn!r}',
+                                 body=parsed)
+    return {'SN': sn}
+
+
 def get_standby_mode(cfg: dict[str, Any] | None = None) -> int:
     """查询待机模式，返回 0 或 1。"""
-    parsed = _request(cfg, 'get')
+    parsed = _request(cfg, 'action=get&object=lidar_data&key=standbymode')
     _check_error_code(parsed, '查询待机模式')
 
     body = parsed.get('Body')
@@ -152,5 +172,40 @@ def set_standby_mode(mode: int, cfg: dict[str, Any] | None = None) -> None:
     if isinstance(mode, bool) or mode not in (MODE_IN_OPERATION, MODE_STANDBY):
         raise LidarArgumentError(f'standby mode 只能是 0 或 1: {mode!r}')
 
-    parsed = _request(cfg, 'set', value=mode)
+    query = f'action=set&object=lidar_data&key=standbymode&value={mode}'
+    parsed = _request(cfg, query)
     _check_error_code(parsed, '设置待机模式')
+
+
+def get_spin_rate(cfg: dict[str, Any] | None = None) -> dict[str, int]:
+    """查询转速，返回 {'index': SpinSpeed 索引, 'rpm': 显示值}。"""
+    parsed = _request(cfg, 'action=get&object=lidar_config')
+    _check_error_code(parsed, '查询转速')
+
+    body = parsed.get('Body')
+    raw = body.get('SpinSpeed') if isinstance(body, dict) else None
+    # 真机返回字符串 '1'/'2'/'3'，也兼容整数；bool 一律视为非法
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        raise LidarResponseError(f'设备返回 SpinSpeed 非法: {raw!r}',
+                                 body=parsed)
+    try:
+        index = int(raw)
+    except ValueError:
+        raise LidarResponseError(f'设备返回 SpinSpeed 非法: {raw!r}',
+                                 body=parsed)
+    rpm = SPIN_INDEX_TO_RPM.get(index)
+    if rpm is None:
+        raise LidarResponseError(f'设备返回 SpinSpeed 非法: {raw!r}',
+                                 body=parsed)
+    return {'index': index, 'rpm': rpm}
+
+
+def set_spin_rate(rpm: int, cfg: dict[str, Any] | None = None) -> None:
+    """按 rpm 设置转速。成功返回 None，失败抛 LidarError。"""
+    if isinstance(rpm, bool) or rpm not in SPIN_RPMS:
+        raise LidarArgumentError(f'转速只能是 300/600/1200: {rpm!r}')
+
+    index = RPM_TO_SPIN_INDEX[rpm]
+    query = f'action=set&object=lidar&key=spin_speed&value={index}'
+    parsed = _request(cfg, query)
+    _check_error_code(parsed, '设置转速')
