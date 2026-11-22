@@ -594,7 +594,7 @@ handler 行为：
 ### 9.3 artifact
 
 - 录制目录、配额判定直接复用现有 `artifact.service`。
-- 新增删除保护：`artifact.service.delete_file()` 在删除前调用 `recorder.client.recording_pcap()`（超时 1.5s）：
+- 新增删除保护：`artifact.service.delete_file()` 在删除前调用 `recorder.service.recording_pcap()`（超时 1.5s）：
   - 返回的文件名等于待删文件 → `正在录制，禁止删除`；
   - daemon 不可达 → 视为没有录制，允许删除（daemon 独占抓包，不可达时不可能正在录制）。
 - sidecar（`*.record.json`）与 pcap 一样出现在 artifact 列表中，可下载；不特殊隐藏。
@@ -619,14 +619,14 @@ handler 行为：
 | --- | --- |
 | `daemon/recorder.py` | 新建：daemon、状态机、预检、抓包、sidecar、HTTP API |
 | `recorder/calibration.py` | 新建：`calibration.json` 读取与严格校验 |
-| `recorder/client.py` | 新建：daemon HTTP 客户端（status / record / recording_pcap） |
+| `recorder/service.py` | 新建：配置读取 + daemon HTTP 客户端（status / record / recording_pcap） |
 | `recorder/commands.py` | 新建：`recorder.record` 定义与 handler |
 | `recorder/views.py` | 新建：只读卡片上下文与两个视图 |
 | `recorder/urls.py` | 新建：`/recorder/`、`/recorder/frag/card` |
 | `recorder/templates/recorder/index.html` | 新建 |
 | `recorder/templates/recorder/_card.html` | 新建 |
 | `recorder/templates/recorder/_card_body.html` | 新建 |
-| `recorder/tests.py` | 重写：daemon / client / command / 视图测试 |
+| `recorder/tests.py` | 重写：daemon / service / command / 视图测试 |
 | `recorder/apps.py` | 保持 |
 | `config/settings.py` | `INSTALLED_APPS` 增加 `recorder` |
 | `config/urls.py` | 增加 `include('recorder.urls')` |
