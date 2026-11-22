@@ -211,11 +211,17 @@ def resolve_file(filename: str) -> Path | None:
 def delete_file(filename: str) -> str | None:
     """删除目录内文件。成功返回 None，失败返回可读错误消息。
 
-    TODO(Recorder 上线后)：当前录制目标文件禁止删除。
+    正在录制的 pcap 由 recorder daemon 独占写入，删除会破坏录制；
+    daemon 不可达时视为没有录制，正常放行。
     """
     path = resolve_file(filename)
     if path is None:
         return '文件不存在或文件名非法'
+
+    from recorder.client import recording_pcap
+
+    if recording_pcap() == filename:
+        return '该文件正在录制，禁止删除'
     try:
         path.unlink()
     except OSError as exc:
