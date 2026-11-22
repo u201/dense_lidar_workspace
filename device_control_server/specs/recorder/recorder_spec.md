@@ -52,7 +52,7 @@ recorder.commands.record  (Django 进程内)
         ▼
 daemon/recorder.py  (常驻，独占抓包工具)
         ├── 预检：recorder 配置 / artifact 目录 / calibration.json / lidar HTTP
-        ├── 查 lidar：get_device_info() → SN，get_spin_rate() → rpm
+        ├── 查 lidar：get_standby_mode() == 0，再取 SN 与 spin_rpm
         ├── 写 sidecar（status=recording）
         ├── spawn dumpcap / tcpdump，阻塞等待退出
         └── 更新 sidecar（succeeded / failed）
@@ -199,11 +199,13 @@ idle ──POST /record（预检通过）──▶ recording ──进程退出�
 3. 解析抓包工具：`dumpcap_path` → PATH → `C:\Program Files\Wireshark\dumpcap.exe`；Linux 用 `shutil.which('tcpdump')`。找不到 → `capture_tool_missing`。
 4. 读取 artifact 配置、解析目录、调用 `artifact.service.get_card()`，要求 `recording_enabled == True`。
 5. 读取并校验 `calibration.json`。
-6. 查询雷达：
+6. 查询雷达，顺序固定：
+   - `lidar.service.get_standby_mode()` → 必须为 `0`（In Operation）；为 `1` → `lidar_standby`，立即终止预检；
    - `lidar.service.get_device_info()` → `SN`；
    - `lidar.service.get_spin_rate()` → `rpm`。
-   - 任一失败 → `lidar_unreachable` / `lidar_response_invalid`。
+   - 网络/超时 → `lidar_unreachable`；响应非法 → `lidar_response_invalid`。
    - v1 不做配置兜底：SN 只能来自设备。
+   - 待机时雷达停止发数据，抓到的 pcap 没有有效内容，因此必须在 spawn 前拦截。
 7. 生成 `record_id` 与路径，确认不冲突。
 
 顺序理由：先做本地可判定项，最后才访问设备；避免标定/目录已坏还去占设备。
@@ -222,7 +224,7 @@ timeout -s INT <duration> tcpdump -i <interface> -n -U -w <pcap> udp port <udp_p
 
 - 参数一律用列表传给 `subprocess.Popen`，不拼 shell 字符串。
 - Windows 正常停止返回 `0`；Linux `0` 与 `124`（timeout 发送 SIGINT）均视为成功。
-- 子进程 stdout/stderr 合并读取；失败时把最后 2 KB 写入 sidecar 的 `error.detail.stderr_tail`。
+- 子进程 `stdout`/`stderr` 合并读取，边读边累积（上限 16 KB），解码后写入 sidecar 的 `process.output`，成功与失败都保留。
 - 录制期间不读取 pcap、不移动文件、不改名。
 
 ### 5.5 sidecar schema
@@ -273,7 +275,9 @@ timeout -s INT <duration> tcpdump -i <interface> -n -U -w <pcap> udp port <udp_p
   },
   "process": {
     "command": ["C:\\Program Files\\Wireshark\\dumpcap.exe", "-i", "WLAN 2", "..."],
-    "returncode": 0
+    "returncode": 0,
+    "output": "Capturing on 'WLAN 2'; Packets captured: 1024; Packets received/dropped on interface 'WLAN 2': 1050/26 (97.5%)",
+    "output_truncated": false
   },
   "error": null
 }
@@ -282,6 +286,7 @@ timeout -s INT <duration> tcpdump -i <interface> -n -U -w <pcap> udp port <udp_p
 字段约定：
 
 - `status`：`recording` / `succeeded` / `failed` / `interrupted`。
+- `process.output`：抓包工具合并后的原始输出，包含 dumpcap / tcpdump 打印的收包与丢包统计；成功与失败都写，超过 16 KB 截断并置 `output_truncated: true`。**不另外解析 `stats` 字段**，需要时从文本读取。
 - `lidar`：只来自设备，不写 `source` 这类恒定字段。
 - `calibration.values`：**整体抄写**校验后的 `calibration.json`，不逐字段挑选，字段增加无需改 recorder。
 - `action.step_index`：**0 基**，与 `run.steps[].index`、页面 `step_<i>_*` 一致；人读为第 `step_index + 1` 步。
@@ -293,7 +298,7 @@ timeout -s INT <duration> tcpdump -i <interface> -n -U -w <pcap> udp port <udp_p
 写入时机：
 
 1. 预检通过、spawn 之前：写 `status: "recording"`，此时 `finished_at`、`pcap_size_bytes`、`process.returncode` 为 `null`。
-2. 进程退出后：重写完整内容，状态改为成功/失败，补 `finished_at`、`pcap_size_bytes`、`process.returncode`。
+2. 进程退出后：重写完整内容，状态改为成功/失败，补 `finished_at`、`pcap_size_bytes`、`process.returncode`、`process.output`。
 3. 预检失败：不写 sidecar（没有 pcap 可对应）。
 4. spawn 失败：写 `status: "failed"`，`pcap_file` 保留预期名，附错误码。
 
@@ -360,6 +365,7 @@ timeout -s INT <duration> tcpdump -i <interface> -n -U -w <pcap> udp port <udp_p
 | 400 | `invalid_duration` / `invalid_action_context` | 参数问题 |
 | 409 | `recorder_busy` | 已有录制在进行 |
 | 422 | `config_invalid` / `calibration_invalid` / `artifact_unavailable` | 本地配置或目录问题 |
+| 422 | `lidar_standby` | 雷达处于待机模式，无有效数据 |
 | 422 | `lidar_unreachable` / `lidar_response_invalid` | 雷达查询失败 |
 | 422 | `capture_tool_missing` / `capture_permission_denied` | 抓包工具问题 |
 | 200 | `capture_failed`（放在 `record.status` / `record.error`） | 进程启动或运行失败，sidecar 仍保留 |
@@ -492,6 +498,7 @@ handler 行为：
 | `calibration_invalid` | `calibration_invalid` |
 | `artifact_unavailable` | `artifact_unavailable` |
 | `config_invalid` | `config_error` |
+| `lidar_standby` | `device_standby` |
 | `lidar_unreachable` / `lidar_response_invalid` | `device_unreachable` |
 | `capture_tool_missing` / `capture_permission_denied` | `capture_unavailable` |
 | `capture_failed` / `daemon_stopped` | `capture_failed` |
@@ -573,9 +580,10 @@ handler 行为：
 
 ### 9.1 lidar
 
-- 依赖 `lidar.service.get_device_info()` 返回 `{'SN': ...}`、`get_spin_rate()` 返回 `{'index', 'rpm'}`；均已存在。
+- 依赖 `lidar.service.get_standby_mode()`、`get_device_info()`、`get_spin_rate()`；均已存在。
+- 待机模式必须为 `0`，否则拒绝录制。
 - 不做 SN 配置兜底；雷达 HTTP 不可达即拒绝录制。
-- 查询发生在 spawn 之前，最多两个超时周期（约 3 秒）。
+- 查询发生在 spawn 之前，最多三个超时周期（约 4.5 秒）。
 
 ### 9.2 calibration
 
@@ -641,19 +649,22 @@ handler 行为：
 3. 找不到 dumpcap / tcpdump → `capture_tool_missing`。
 4. artifact 目录不存在、不可写、配额已满 → `artifact_unavailable`。
 5. calibration 缺失 / JSON 非法 / 缺必填键 / alpha 越界 / `arm_meter=0` / bool 冒充 number → `calibration_invalid`。
-6. lidar 不可达 / SN 非法 / SpinSpeed 非法 → 对应错误，且**未 spawn**。
-7. 预检失败时输出目录不新增任何 pcap / sidecar。
+6. 待机模式为 `1` → `lidar_standby`，且**未 spawn**。
+7. lidar 不可达 / SN 非法 / SpinSpeed 非法 → 对应错误，且**未 spawn**。
+8. 预检失败时输出目录不新增任何 pcap / sidecar。
 
 ### 11.2 daemon 抓包与 sidecar
 
 1. Windows 命令为 dumpcap 参数列表；Linux 命令为 `timeout -s INT ... tcpdump ...`。
 2. 成功退出（Windows 0 / Linux 0 或 124）→ sidecar `succeeded`，含 `returncode`、`pcap_size_bytes`、`finished_at`。
-3. 非零退出 → sidecar `failed`，`error.code = "capture_failed"`，保留 stderr 尾部。
+3. 非零退出 → sidecar `failed`，`error.code = "capture_failed"`，`process.output` 保留工具输出。
 4. 录制中 `GET /status` 返回 `recording` 与 `elapsed_seconds`，且可被并发访问。
 5. 第二个 `POST /record` → `409 recorder_busy`。
 6. sidecar `action` 块原样保存请求内容；`step_index` / `step_count` 越界 → `invalid_action_context`。
 7. `calibration.values` 与 `calibration.json` 内容逐键一致，含额外键；`sha256` / `mtime` 正确。
 8. sidecar 采用原子写：模拟中途失败不留下半个 JSON。
+9. `process.output` 原样保存 dumpcap / tcpdump 的收包与丢包统计文本，不生成 `stats` 子对象；超 16 KB 时截断并置 `output_truncated: true`。
+10. 输出解码为 UTF-8 → GBK → replace；中文网卡名不乱码。
 
 ### 11.3 重启恢复
 
@@ -687,9 +698,9 @@ handler 行为：
 ## 12. 验收标准
 
 1. action 中配置 `recorder.record`，执行后输出目录生成同 stem 的 `.pcap` 与 `.record.json`。
-2. sidecar 包含 `record_id`、时长、起止时间、网卡/端口/BPF、pcap 大小、`lidar.sn`、`lidar.spin_rpm`、完整 `calibration.values` + `mtime` + `sha256`、`action`（含 `step_index` / `step_count` / 已解析 steps）。
+2. sidecar 包含 `record_id`、时长、起止时间、网卡/端口/BPF、pcap 大小、`lidar.sn`、`lidar.spin_rpm`、完整 `calibration.values` + `mtime` + `sha256`、`action`（含 `step_index` / `step_count` / 已解析 steps）、`process.output`（含抓包工具打印的收包/丢包统计）。
 3. 标定缺失或非法时拒绝录制，不产生 pcap；错误在 action 结果中可见。
-4. 雷达不可达时拒绝录制，不产生 pcap。
+4. 雷达待机或不可达时拒绝录制，不产生 pcap；待机错误提示先执行 `lidar.standby(mode=0)`。
 5. 同一时刻只允许一个录制；第二个请求得到 `recorder_busy`。
 6. 录制期间 `/recorder/` 能看到当前 `record_id` 与已录秒数；artifact 页面无法删除当前 pcap。
 7. daemon 重启后，遗留 `recording` sidecar 变为 `interrupted`，pcap 保留。
@@ -701,6 +712,7 @@ handler 行为：
 - 录制是阻塞步骤：actor 单线程，长录制会推迟其他预约；需要并发时再引入异步记录 ID 机制。
 - 不支持取消正在进行的录制；v1 只能等它自然结束或重启 daemon。
 - 只支持单网卡、单雷达；多雷达需要新增 `recorder.targets[]` 配置与多实例状态机。
-- 不做 pcap 完整性校验（例如包数、丢包率）；只记录文件大小与退出码。
+- 不解析 pcap 内容，也不把 `process.output` 里的丢包统计结构化；丢包数字仅以工具原始文本保留。
+- 预检到 spawn 之间，雷达仍可能被其他客户端切回待机；v1 不消除该竞态。
 - 不做标定值的合理性交叉校验（例如 alpha1 与 alpha2 是否互补），只做范围检查。
 - `calibration.json` 的写入由人工负责；daemon 不提供写入接口。
