@@ -1,0 +1,40 @@
+{# 只读卡片内容：首屏由 index 渲染，刷新后由 card 视图重渲染 #}
+<p class="status status-{{ status }}">{{ status_label }}</p>
+
+{% if detail %}
+  <p class="banner error">{{ detail }}</p>
+{% endif %}
+
+<p>网卡：{{ config.interface|default:"（未配置）" }} · UDP 端口：{{ config.udp_port|default:"（未配置）" }}</p>
+<p class="folder">{{ config.folder|default:"（未配置输出目录）" }}</p>
+
+{% if artifact.ready %}
+  <p>
+    输出目录可用，Used {{ artifact.used_bytes|filesizeformat }} /
+    Quota {{ artifact.quota_bytes|filesizeformat }}
+  </p>
+{% else %}
+  <p class="banner error">输出目录不可用：{{ artifact.blocked_reason|default:"未知原因" }}</p>
+{% endif %}
+
+{% if calibration.ok %}
+  <p>
+    标定：alpha1 {{ calibration.values.alpha1_degrees }}° ·
+    alpha2 {{ calibration.values.alpha2_degrees }}° ·
+    arm {{ calibration.values.arm_meter }} m
+  </p>
+  {% if calibration.values.calibrated_at %}
+    <p class="folder">标定时间：{{ calibration.values.calibrated_at }}</p>
+  {% endif %}
+{% else %}
+  <p class="banner error">标定无效：{{ calibration.error }}</p>
+{% endif %}
+
+{% if not daemon.reachable %}
+  <p class="folder">守护进程不可达，无法获知录制状态。</p>
+{% elif daemon.recording %}
+  <p>录制中：{{ daemon.record_id }}</p>
+  <p class="folder">{{ daemon.pcap_file }} · 已录 {{ daemon.elapsed_seconds }} 秒</p>
+{% else %}
+  <p>当前无录制。</p>
+{% endif %}
