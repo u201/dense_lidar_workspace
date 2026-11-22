@@ -3,8 +3,16 @@
 
 <p class="folder">{{ device|default:"（未配置设备地址）" }}</p>
 
+{% if device_info %}
+  <p>序列号（SN）：{{ device_info.SN }}</p>
+{% endif %}
+
 {% if mode_label %}
   <p>待机模式：{{ mode }} · {{ mode_label }}</p>
+{% endif %}
+
+{% if spin %}
+  <p>转速：{{ spin.rpm }} rpm（SpinSpeed={{ spin.index }}）</p>
 {% endif %}
 
 {% if detail %}
