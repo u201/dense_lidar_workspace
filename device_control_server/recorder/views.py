@@ -9,7 +9,7 @@ from django.views.decorators.http import require_http_methods
 
 from artifact import service as artifact_service
 
-from . import calibration, client
+from . import calibration, service
 
 
 def _card_context() -> dict:
@@ -58,8 +58,8 @@ def _card_context() -> dict:
             'ok': True, 'values': snapshot['values'], 'error': None}
 
     try:
-        cfg = client.load_config()
-    except client.RecorderConfigError as exc:
+        cfg = service.load_config()
+    except service.RecorderConfigError as exc:
         context['status'] = 'config_error'
         context['status_label'] = '配置错误'
         context['detail'] = exc.message
@@ -69,8 +69,8 @@ def _card_context() -> dict:
     context['config']['udp_port'] = cfg['udp_port']
 
     try:
-        snapshot = client.status(cfg=cfg)
-    except client.RecorderError as exc:
+        snapshot = service.status(cfg=cfg)
+    except service.RecorderError as exc:
         context['status'] = 'offline'
         context['status_label'] = '守护进程离线'
         context['detail'] = exc.message

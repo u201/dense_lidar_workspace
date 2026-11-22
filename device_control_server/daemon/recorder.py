@@ -37,7 +37,7 @@ django.setup()
 from artifact import service as artifact_service  # noqa: E402
 from lidar import service as lidar_service  # noqa: E402
 from recorder import calibration  # noqa: E402
-from recorder import client  # noqa: E402
+from recorder import service as recorder_service  # noqa: E402
 
 logger = logging.getLogger('recorder')
 
@@ -295,8 +295,8 @@ def preflight(duration: Any, action: Any) -> dict[str, Any]:
     validated_action = validate_action(action)
 
     try:
-        cfg = client.load_config()
-    except client.RecorderError as exc:
+        cfg = recorder_service.load_config()
+    except recorder_service.RecorderError as exc:
         raise RecorderRequestError(422, 'config_invalid', exc.message)
 
     capture_tool = resolve_capture_tool(cfg)
@@ -347,7 +347,7 @@ class Recorder:
             proc.terminate()
 
     def run_forever(self) -> None:
-        cfg = client.load_config()
+        cfg = recorder_service.load_config()
         self._recover_stale_sidecars()
         self._start_http(cfg['device_ip'], cfg['port'])
         logger.info('recorder started on http://%s:%s',
@@ -653,7 +653,7 @@ def main() -> int:
 
     try:
         recorder.run_forever()
-    except client.RecorderError as exc:
+    except recorder_service.RecorderError as exc:
         logger.error('recorder cannot start: %s', exc.message)
         return 1
     except OSError as exc:

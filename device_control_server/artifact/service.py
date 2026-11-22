@@ -218,7 +218,7 @@ def delete_file(filename: str) -> str | None:
     if path is None:
         return '文件不存在或文件名非法'
 
-    from recorder.client import recording_pcap
+    from recorder.service import recording_pcap
 
     if recording_pcap() == filename:
         return '该文件正在录制，禁止删除'

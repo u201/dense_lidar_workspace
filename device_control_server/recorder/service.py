@@ -1,7 +1,10 @@
-"""Recorder 配置读取与守护进程 HTTP 客户端。
+"""Recorder 配置读取与守护进程 HTTP 访问。
 
 纯库：不依赖 Django。web 视图、command handler、daemon 启动都复用这里的
 配置校验与请求逻辑，避免三处各写一套。
+
+边界：本模块只做配置读取与 daemon HTTP 访问，不抓包、不写 sidecar；
+抓包与落盘全部在 daemon/recorder.py。
 """
 
 from __future__ import annotations

@@ -10,7 +10,7 @@ from typing import Any
 
 from action.registry import CommandError
 
-from . import client
+from . import service
 
 # daemon error code → CommandError code（spec 第 7 节）
 CODE_MAP = {
@@ -50,8 +50,8 @@ def _elapsed_seconds(sidecar: dict[str, Any]) -> float | None:
 
 def record(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     try:
-        cfg = client.load_config()
-    except client.RecorderConfigError as exc:
+        cfg = service.load_config()
+    except service.RecorderConfigError as exc:
         raise CommandError('config_error', exc.message)
 
     action = ctx.get('action')
@@ -67,12 +67,12 @@ def record(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
 
     duration = args['duration']
     try:
-        sidecar = client.record(
+        sidecar = service.record(
             duration, action, cfg=cfg,
             timeout=duration + TIMEOUT_MARGIN_SECONDS)
-    except client.RecorderUnreachableError as exc:
+    except service.RecorderUnreachableError as exc:
         raise CommandError('recorder_unreachable', exc.message)
-    except client.RecorderError as exc:
+    except service.RecorderError as exc:
         raise CommandError(CODE_MAP.get(exc.code, 'recorder_error'),
                            exc.message, exc.detail)
 
