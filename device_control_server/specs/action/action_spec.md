@@ -388,7 +388,7 @@ POST http://127.0.0.1:{action.port}/current/abort
 
 1. 校验 `current` 非空且 `current.instance_id == 请求 instance_id`；不匹配 → `409`，`{ok: false, error: {...}}`。
 2. 设置 `current.cancel_requested = true`，把实例文件 `status` 写为 `cancelling`。
-3. **立即**调用注册表里的 `recorder.abort`（见 recorder_spec 5.8），打断阻塞中的 `recorder.record`。这是必须的快路径：actor 主循环卡在阻塞步骤里，只有 HTTP 线程能打断它。
+3. **立即**调用注册表里的 `recorder.abort`（不传 `record_id`，中止当前唯一录制；见 recorder_spec 5.8），打断阻塞中的 `recorder.record`。这是必须的快路径：actor 主循环卡在阻塞步骤里，只有 HTTP 线程能打断它。
 4. 返回 `202 {ok: true}`，不等待 cleanup 完成。
 5. 后续 tick：阻塞步骤返回后，跳过剩余 steps，进入 cleanup；cleanup 完成后落盘 `aborted`。
 
@@ -435,7 +435,7 @@ recorder web 卡片继续只读，不在 recorder 页面提供中止按钮；中
 
 1. **进程存活期间** cleanup 保证执行一次；actor 崩溃或断电不保证 cleanup 执行，遗留 `running` / `cancelling` 实例由重启恢复标记为 `failed`（`actor_restarted`）。
 2. 中止是幂等的：对 `cancelling` 重复发 abort 返回成功但不重复动作。
-3. `recorder.abort` 按 `record_id` / `run_id` 限定，空闲时为 no-op，不误停其他 action 新开始的录制。
+3. `recorder.abort` 只按 `record_id` 限定（可选）：不传则中止当前唯一录制；进程内单实例，不引入 `run_id` / `instance_id` 作用域。
 4. `cancelling` 可能持续到当前阻塞步骤返回；UI 以「中止中」呈现，不提前显示「已中止」。
 5. 对无中止能力的 command，中止只保证跳过后续 steps，当前步骤会跑到自然返回。
 
