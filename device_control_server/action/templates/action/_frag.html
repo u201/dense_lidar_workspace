@@ -1,0 +1,16 @@
+{# action 卡片集合：独立页与门户片段共用 #}
+{% if file_error %}
+  <section class="card">
+    <p class="banner error">{{ file_error }}</p>
+  </section>
+{% endif %}
+
+{% include "action/_instances_card.html" %}
+
+{% for action in actions %}
+  {% include "action/_card.html" %}
+{% empty %}
+  {% if not file_error %}
+    <section class="card"><p class="empty">没有可用 action</p></section>
+  {% endif %}
+{% endfor %}

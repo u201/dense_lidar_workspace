@@ -3,31 +3,5 @@
 {% block title %}Actions{% endblock %}
 
 {% block content %}
-  {% if file_error %}
-    <section class="card">
-      <p class="banner error">{{ file_error }}</p>
-    </section>
-  {% endif %}
-
-  <section class="card" id="instances-card">
-    <header class="card-header">
-      <h2>执行状态</h2>
-      <button class="op"
-              hx-get="{% url 'action:instances' %}"
-              hx-target="#instances-body"
-              hx-swap="innerHTML"
-              hx-disabled-elt="this">刷新</button>
-    </header>
-    <div id="instances-body">
-      {% include "action/_instances.html" %}
-    </div>
-  </section>
-
-  {% for action in actions %}
-    {% include "action/_card.html" %}
-  {% empty %}
-    {% if not file_error %}
-      <section class="card"><p class="empty">没有可用 action</p></section>
-    {% endif %}
-  {% endfor %}
+  {% include "action/_frag.html" %}
 {% endblock %}
