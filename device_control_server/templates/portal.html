@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block title %}设备控制门户{% endblock %}
+
+{% block content %}
+  <section class="card" id="lidar-card">
+    <header class="card-header">
+      <h2>Lidar</h2>
+      <button class="op"
+              hx-get="{% url 'lidar:card' %}"
+              hx-target="#lidar-body"
+              hx-swap="innerHTML"
+              hx-disabled-elt="this">刷新</button>
+    </header>
+    <div id="lidar-body"
+         hx-get="{% url 'lidar:card' %}"
+         hx-trigger="load"
+         hx-swap="innerHTML">
+      <p class="empty">加载中…</p>
+    </div>
+  </section>
+
+  <section class="card" id="recorder-card">
+    <header class="card-header">
+      <h2>Recorder</h2>
+      <button class="op"
+              hx-get="{% url 'recorder:card' %}"
+              hx-target="#recorder-body"
+              hx-swap="innerHTML"
+              hx-disabled-elt="this">刷新</button>
+    </header>
+    <div id="recorder-body"
+         hx-get="{% url 'recorder:card' %}"
+         hx-trigger="load"
+         hx-swap="innerHTML">
+      <p class="empty">加载中…</p>
+    </div>
+  </section>
+
+  <section class="card" id="artifact-card">
+    <header class="card-header">
+      <h2>Artifact</h2>
+      <button class="op"
+              hx-get="{% url 'artifact:card' %}"
+              hx-target="#artifact-body"
+              hx-swap="innerHTML"
+              hx-disabled-elt="this">刷新</button>
+    </header>
+    <div id="artifact-body"
+         hx-get="{% url 'artifact:card' %}"
+         hx-trigger="load"
+         hx-swap="innerHTML">
+      <p class="empty">加载中…</p>
+    </div>
+  </section>
+
+  {# action 片段自带多张卡片，用 display:contents 让它们直接成为栅格子项 #}
+  <div id="action-cards" class="contents"
+       hx-get="{% url 'action:card' %}"
+       hx-trigger="load"
+       hx-swap="innerHTML">
+    <p class="empty">加载中…</p>
+  </div>
+{% endblock %}
