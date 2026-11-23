@@ -27,15 +27,16 @@
 5. 单实例结果轮询端点，终态后停止轮询。
 6. 删除 `action/service.py` 的同步执行函数与旧的 pending 列表函数。
 7. 测试与验收标准。
-8. `cleanup` 组（finally 语义）与执行中实例中止（Phase 3）。
+8. `cleanup` 组（finally 语义）：与 `steps` 同级，成功 / 失败 / 中止都执行一次（Phase 3）。
+9. 执行中实例中止：`running → cancelling → aborted`，含 actor `POST /current/abort` 与 web 中止按钮（Phase 3，见第 7 节）。
 
 ### 2.2 不包含
 
-- 不引入 vars / `${}` / object 参数；Phase 3 在 `steps` 同级新增可选的 `cleanup` 组。
-- 不修改 `daemon/actor.py` 的执行语义（除 Phase 2 的 `kind` 一行）。
+- 不引入 vars / `${}` / object 参数；`cleanup` 只使用动作定义中的值，不支持表单覆盖。
+- 不修改 actor 的单线程、单实例调度模型；执行语义仅按 Phase 2（`kind` 透传）与 Phase 3（cleanup / 中止）扩展。
 - 不新增数据库模型、队列、WebSocket、SSE。
 - 不做历史分页、筛选、搜索；只保留最近完成的固定条数。
-- 支持 pending 取消与 running 中止（Phase 3，见第 7 节）。
+- 不支持暂停、续跑、回滚已执行步骤；中止后不可恢复。
 - 不实现 `lidar-refresh` 的跨模块自动刷新（见第 8 节）。
 
 ## 3. 总体架构
@@ -82,7 +83,7 @@ Phase 2
 | `steps` | array | 已解析的步骤快照（含表单覆盖） |
 | `cleanup` | array | **新增（Phase 3）**，已解析的 cleanup 步骤快照；旧文件缺失时按空数组处理 |
 | `run` | object/null | 执行结果；**actor 只在 `_finish` 时写入**，运行中为 `null`；终态时含 `steps` 与 `cleanup` 两个结果数组 |
-| `error` | object/null | 实例级错误（expired / superseded / actor_restarted / cancelled） |
+| `error` | object/null | 实例级错误（expired / superseded / actor_restarted / cancelled / aborted / cleanup_failed） |
 
 不新增 `wait_until`：执行中的等待时间以 `/current.not_before` 为准，避免 actor 额外落盘。
 
