@@ -18,10 +18,7 @@
               hx-swap="innerHTML"
               hx-disabled-elt="this">刷新</button>
     </header>
-    <div id="instances-body"
-         hx-get="{% url 'action:instances' %}"
-         hx-trigger="instances-refresh from:body"
-         hx-swap="innerHTML">
+    <div id="instances-body">
       {% include "action/_instances.html" %}
     </div>
   </section>
