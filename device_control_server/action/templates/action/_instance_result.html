@@ -1,0 +1,31 @@
+{# 单实例结果：非终态时每秒轮询自身，终态后移除轮询属性 #}
+<div {% if instance and not instance.terminal %}
+     hx-get="{% url 'action:instance_result' instance.instance_id %}"
+     hx-trigger="every 1s"
+     hx-swap="outerHTML"{% endif %}>
+  {% if error %}
+    <p class="banner error">{{ error }}</p>
+  {% endif %}
+
+  {% if instance %}
+    <p class="status status-{{ instance.status_class }}">{{ instance.status_label }}</p>
+    <p class="folder">run_id: {{ instance.run.run_id|default:instance.instance_id }}</p>
+    <p class="folder">
+      进度 {{ instance.done_steps }}/{{ instance.total_steps }}
+      {% if instance.waiting %} · 等待至 {{ instance.wait_until_local }}{% endif %}
+      {% if instance.pending_command %} · 下一步 {{ instance.pending_command }}{% endif %}
+    </p>
+    {% if instance.failure_text %}
+      <p class="banner error">{{ instance.failure_text }}</p>
+    {% endif %}
+    {% for step in instance.run.steps %}
+      <p>步骤 {{ step.index }} · {{ step.command }} · {{ step.status }} · {{ step.duration_ms }} ms</p>
+      {% if step.error %}
+        <p class="banner error">{{ step.error.code }}: {{ step.error.message }}</p>
+      {% endif %}
+      {% if step.result %}
+        <p class="folder">{{ step.result }}</p>
+      {% endif %}
+    {% endfor %}
+  {% endif %}
+</div>
