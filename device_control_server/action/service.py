@@ -13,6 +13,7 @@ import json
 import os
 import re
 import time
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -36,6 +37,34 @@ DEFAULT_EXPIRE_SECONDS = 600
 
 # 单步 delay 上限：防止一个等待把 actor 的调度拖得过长。
 MAX_DELAY_SECONDS = 600
+
+# 查询 actor /current 的超时：状态接口是附加能力，慢响应不能拖住页面。
+CURRENT_TIMEOUT_SECONDS = 0.5
+
+# 实例状态 → 页面文案 / 样式类；未知状态原样显示。
+STATUS_LABELS = {
+    'pending': '等待执行',
+    'running': '执行中',
+    'succeeded': '成功',
+    'failed': '失败',
+    'expired': '已过期',
+    'superseded': '被覆盖',
+    'cancelled': '已取消',
+}
+STATUS_CLASSES = {
+    'pending': 'offline',
+    'running': 'running',
+    'succeeded': 'ok',
+    'failed': 'abnormal',
+    'expired': 'abnormal',
+    'superseded': 'abnormal',
+    'cancelled': 'offline',
+}
+TERMINAL_STATUSES = frozenset(
+    {'succeeded', 'failed', 'expired', 'superseded', 'cancelled'})
+
+# 执行状态区保留的已完成实例条数；进行中的实例全部展示。
+INSTANCE_HISTORY_LIMIT = 20
 
 
 # ---------------------------------------------------------------------------
@@ -752,6 +781,154 @@ def list_pending_instances() -> list[dict[str, Any]]:
     pending.sort(key=lambda item: (parse_utc(item['scheduled_at']),
                                    parse_utc(item['created_at'])))
     return pending
+
+
+# ---------------------------------------------------------------------------
+# 执行状态视图（web 展示；Phase 1 不改 actor）
+# ---------------------------------------------------------------------------
+
+def current_snapshot() -> dict[str, Any] | None:
+    """读取 actor 的 /current；未启动、超时或响应异常都返回 None。"""
+    try:
+        port = load_action_config()['http_port']
+    except ActionConfigError:
+        return None
+    try:
+        with urllib.request.urlopen(
+                f'http://127.0.0.1:{port}/current',
+                timeout=CURRENT_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _live_matches(live: dict[str, Any] | None,
+                  instance: dict[str, Any]) -> bool:
+    return (isinstance(live, dict)
+            and live.get('running') is True
+            and live.get('instance_id') == instance.get('instance_id'))
+
+
+def _local_or_none(text: Any) -> str | None:
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        return _format_local(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _failure_text(instance: dict[str, Any],
+                  run: dict[str, Any]) -> str | None:
+    """实例错误优先，其次最后一个失败步骤，最后 run.error。"""
+    error = instance.get('error')
+    if isinstance(error, dict) and error.get('message'):
+        return f'{error.get("code", "error")}: {error["message"]}'
+
+    for step in reversed(run.get('steps') or []):
+        step_error = step.get('error')
+        if step.get('status') == 'failed' and isinstance(step_error, dict):
+            return (f'步骤 {step.get("index")} {step.get("command")}: '
+                    f'{step_error.get("code", "error")}: '
+                    f'{step_error.get("message", "")}')
+
+    run_error = run.get('error')
+    if isinstance(run_error, dict) and run_error.get('message'):
+        return f'{run_error.get("code", "error")}: {run_error["message"]}'
+    return None
+
+
+def instance_view(instance: dict[str, Any],
+                  live: dict[str, Any] | None = None
+                  ) -> dict[str, Any]:
+    """把实例文件与 actor /current 合并成模板可直接使用的视图。"""
+    status = instance.get('status') or 'pending'
+    terminal = status in TERMINAL_STATUSES
+    steps = instance.get('steps') or []
+    run = instance.get('run') or {}
+
+    if not terminal and _live_matches(live, instance):
+        run = live.get('run') or run
+        total = live.get('total_steps')
+        total = total if isinstance(total, int) else len(steps)
+        done = live.get('next_index')
+        done = done if isinstance(done, int) else 0
+        wait_until = live.get('not_before')
+    else:
+        total = len(steps)
+        done = len(run.get('steps') or [])
+        wait_until = None
+
+    done = max(0, min(done, total))
+    pending_command = (steps[done].get('command')
+                       if status == 'running' and done < len(steps) else None)
+
+    now = datetime.now(timezone.utc)
+    waiting = False
+    if isinstance(wait_until, str):
+        try:
+            waiting = parse_utc(wait_until) > now
+        except (TypeError, ValueError):
+            waiting = False
+
+    view = dict(instance)
+    view.update({
+        'status_label': STATUS_LABELS.get(status, status),
+        'status_class': STATUS_CLASSES.get(status, 'offline'),
+        'terminal': terminal,
+        'run': run,
+        'done_steps': done,
+        'total_steps': total,
+        'pending_command': pending_command,
+        'waiting': waiting,
+        'wait_until_local': _local_or_none(wait_until) if waiting else None,
+        'scheduled_local': _local_or_none(instance.get('scheduled_at')),
+        'created_local': _local_or_none(instance.get('created_at')),
+        'started_local': _local_or_none(instance.get('started_at')),
+        'finished_local': _local_or_none(instance.get('finished_at')),
+        'failure_text': _failure_text(instance, run),
+    })
+    return view
+
+
+def _sort_time(instance: dict[str, Any], field: str) -> datetime:
+    try:
+        return parse_utc(instance[field])
+    except (KeyError, TypeError, ValueError):
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def list_instances(limit: int = INSTANCE_HISTORY_LIMIT
+                   ) -> list[dict[str, Any]]:
+    """进行中实例（含实时进度）+ 最近完成实例，供执行状态区展示。"""
+    live = current_snapshot()
+    now = datetime.now(timezone.utc)
+    active: list[dict[str, Any]] = []
+    finished: list[dict[str, Any]] = []
+
+    for instance in iter_instances():
+        if instance.get('status') == 'pending':
+            try:
+                scheduled_at = parse_utc(instance['scheduled_at'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            expire_after = instance.get('expire_after_seconds',
+                                        get_expire_after_seconds())
+            if now - scheduled_at > timedelta(seconds=expire_after):
+                continue
+
+        item = instance_view(instance, live)
+        if item['terminal']:
+            finished.append(item)
+        else:
+            active.append(item)
+
+    active.sort(key=lambda item: (_sort_time(item, 'scheduled_at'),
+                                  _sort_time(item, 'created_at')))
+    finished.sort(key=lambda item: _sort_time(item, 'created_at'),
+                  reverse=True)
+    return active + finished[:limit]
 
 
 def cancel_instance(instance_id: str) -> str | None:
