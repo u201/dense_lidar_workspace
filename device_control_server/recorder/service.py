@@ -192,6 +192,21 @@ def record(duration: int, action: dict[str, Any], *,
     return final
 
 
+def abort(record_id: str | None = None, *,
+          cfg: dict[str, Any] | None = None,
+          timeout: float | None = None) -> dict[str, Any]:
+    """POST /abort，中止当前录制；空闲时返回 aborted=False。"""
+    cfg = cfg if cfg is not None else load_config()
+    payload = _request_json(
+        cfg, 'POST', '/abort',
+        {'record_id': record_id} if record_id else {},
+        timeout=timeout)
+    if not isinstance(payload, dict) or not payload.get('ok'):
+        _raise_daemon_error(payload)
+        raise RecorderError('invalid_response', '守护进程中止响应结构非法')
+    return payload
+
+
 def recording_pcap(timeout: float = DEFAULT_TIMEOUT) -> str | None:
     """返回正在录制的 pcap 文件名；空闲、不可达或异常一律返回 None。"""
     try:
