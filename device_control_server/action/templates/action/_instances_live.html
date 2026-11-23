@@ -1,0 +1,66 @@
+{# 轮询片段：有进行中实例时每 2s 刷新自身；无则只保留 instances-refresh 监听 #}
+<div id="instances-live"
+     hx-get="{% url 'action:instances_live' %}"
+     hx-trigger="instances-refresh from:body{% if has_active %}, every 2s{% endif %}"
+     hx-sync="this:replace"
+     hx-swap="outerHTML">
+  {% if error %}
+    <p class="banner error">{{ error }}</p>
+  {% endif %}
+
+  {% if instances %}
+    <table>
+      <thead>
+        <tr>
+          <th>动作</th>
+          <th>状态</th>
+          <th>时间</th>
+          <th>进度</th>
+          <th>详情</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for instance in instances %}
+          <tr>
+            <td class="filename">{{ instance.title }}</td>
+            <td><span class="status-inline status-{{ instance.status_class }}">{{ instance.status_label }}</span></td>
+            <td class="mtime">
+              {% if instance.status == 'pending' %}
+                计划 {{ instance.scheduled_local }}
+              {% elif instance.started_local %}
+                开始 {{ instance.started_local }}
+              {% else %}
+                {{ instance.created_local }}
+              {% endif %}
+            </td>
+            <td class="mtime">
+              {{ instance.done_steps }}/{{ instance.total_steps }}
+              {% if instance.waiting %}
+                <br>等待至 {{ instance.wait_until_local }}
+              {% elif instance.pending_command %}
+                <br>{{ instance.pending_command }}
+              {% endif %}
+            </td>
+            <td>{{ instance.failure_text|default:"" }}</td>
+            <td class="ops">
+              {% if instance.status == 'pending' %}
+                <form class="inline"
+                      hx-post="{% url 'action:cancel' instance.instance_id %}"
+                      hx-target="#instances-live"
+                      hx-swap="outerHTML"
+                      hx-disabled-elt="find button"
+                      hx-confirm="取消预约 {{ instance.title }}？">
+                  {% csrf_token %}
+                  <button class="op danger" type="submit">取消</button>
+                </form>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">暂无执行实例</p>
+  {% endif %}
+</div>
