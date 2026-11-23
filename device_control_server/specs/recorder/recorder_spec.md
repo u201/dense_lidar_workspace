@@ -24,7 +24,7 @@
 3. `calibration.json` 的严格校验与快照。
 4. 抓包命令构造（Windows dumpcap / Linux tcpdump）、单实例互斥、进程退出处理。
 5. sidecar 的 schema、写入时机、原子写、重启恢复。
-6. recorder 守护进程的本地 HTTP API（status / record）。
+6. recorder 守护进程的本地 HTTP API（status / record / abort）。
 7. `recorder` Django app 的 URL、视图、模板、只读卡片。
 8. `recorder.record` command 的 schema、handler、错误映射。
 9. 对 action、lidar、artifact 的最小改动清单。
@@ -32,7 +32,7 @@
 
 ### 2.2 不包含
 
-- 不提供录制取消 / 暂停 / 续录；v1 只有“开始 → 自然结束”。
+- 支持单次录制中止（`POST /abort`，见 5.8）；不支持暂停、续录。
 - 不提供 web 端手动录制入口，录制只能由 action 触发。
 - 不做多网卡、多雷达并发录制；进程内单实例。
 - 不做 pcap 解析、点云转换、上传、压缩、分片。
@@ -179,10 +179,13 @@ record-20261122T101500123456Z.record.json
 ### 5.2 状态机
 
 ```text
-idle ──POST /record（预检通过）──▶ recording ──进程退出──▶ idle
+idle ──POST /record（预检通过）──▶ recording ──进程自然退出──▶ idle
   ▲                                    │
+  │                                    ├── POST /abort ──▶ sidecar=aborted ──▶ idle
   └──────── 预检失败 / 进程启动失败 ◀──┘
 ```
+
+`POST /abort`（5.8）只中止当前录制、不停止 daemon；与 daemon 收到 SIGTERM 走的 `failed/daemon_stopped`（5.7）不同。
 
 进程内只允许一个 `recording`：
 
@@ -285,7 +288,7 @@ timeout -s INT <duration> tcpdump -i <interface> -n -U -w <pcap> udp port <udp_p
 
 字段约定：
 
-- `status`：`recording` / `succeeded` / `failed` / `interrupted`。
+- `status`：`recording` / `succeeded` / `failed` / `interrupted` / `aborted`。
 - `process.output`：抓包工具合并后的原始输出，包含 dumpcap / tcpdump 打印的收包与丢包统计；成功与失败都写，超过 16 KB 截断并置 `output_truncated: true`。**不另外解析 `stats` 字段**，需要时从文本读取。
 - `lidar`：只来自设备，不写 `source` 这类恒定字段。
 - `calibration.values`：**整体抄写**校验后的 `calibration.json`，不逐字段挑选，字段增加无需改 recorder。
@@ -380,6 +383,28 @@ timeout -s INT <duration> tcpdump -i <interface> -n -U -w <pcap> udp port <udp_p
 - daemon 收到 SIGINT / SIGTERM：
   - 若正在录制，向子进程发终止信号，等待退出，落盘为 `"failed"`，`error.code = "daemon_stopped"`。
   - 超时未退出则记录后直接退出，下次启动按 restart 规则处理。
+
+### 5.8 单次录制中止（`POST /abort`）
+
+新增本地 HTTP 端点，用于中止当前正在进行的单次录制（不暂停、不续录、不停止 daemon）：
+
+```
+POST http://{recorder.device_ip}:{recorder.port}/abort
+{"record_id": "<可选，当前录制 ID>"}
+```
+
+行为：
+
+1. **空闲**（无 `current`）→ `200 {ok: true, aborted: false}`，幂等 no-op，不报错、不产生 sidecar。
+2. **`record_id` 不匹配**（请求体提供了 `record_id` 且与当前不一致）→ `409 {ok: false, error: {code: "record_mismatch", ...}}`，不误停其他录制。
+3. **匹配或未提供 `record_id`** → 终止抓包子进程，把 sidecar 终态写为 `aborted`，保留 `pcap_file`、`pcap_size_bytes`、`process.output`、`process.returncode`，`error.code = "recorder_aborted"`；随后回到 `idle`。
+4. 与进程退出分离：不设置 daemon 的全局停止标志，daemon 继续存活；SIGINT/SIGTERM 仍按 5.7 走 `failed/daemon_stopped`。
+5. 终态判定优先级：`_record_locked` 在进程退出后先判断「是否收到过 abort」，再判断返回码 / pcap 大小，避免中止被「pcap 为空 = 失败」覆盖。
+6. sidecar 一旦写入终态（`succeeded` / `failed` / `aborted` / `interrupted`）不可再改写；abort 到达时若录制已自然结束，返回 `200 {ok: true, aborted: false}`，不回溯改写。
+
+`GET /status` 不受影响，录制中仍返回 `recording`。
+
+action 通过 `recorder.abort` command 调用本端点（cleanup 组可用）；`recorder.record` handler 收到 `status == "aborted"` 的 sidecar 时，抛出 `CommandError('recorder_aborted', ...)`，使 actor 把该步骤记为失败并进入 cleanup（见 action_spec 第 7 节）。
 
 ## 6. `recorder` Django app
 
@@ -502,6 +527,7 @@ handler 行为：
 | `lidar_unreachable` / `lidar_response_invalid` | `device_unreachable` |
 | `capture_tool_missing` / `capture_permission_denied` | `capture_unavailable` |
 | `capture_failed` / `daemon_stopped` | `capture_failed` |
+| `recorder_aborted` | `recorder_aborted` |
 | 连接失败 / 超时 | `recorder_unreachable` |
 
 6. 成功返回：
@@ -517,6 +543,10 @@ handler 行为：
 ```
 
 7. `action/registry.py` 的 `COMMAND_MODULES` 增加 `'recorder.commands'`。
+
+#### `recorder.abort`
+
+（Phase 3 新增）调用 daemon `POST /abort`；参数可选 `record_id`。空闲时 no-op 返回成功，不抛错；`record_id` 不匹配抛 `CommandError('record_mismatch', ...)`。用于 action 的 cleanup 组与 actor 中止快路径（见 action_spec 第 7 节）。
 
 ## 8. 与 action 的契约
 
@@ -557,7 +587,7 @@ handler 行为：
 - `recorder.record` 是同步阻塞步骤：`dumpcap` 退出后才返回，后续步骤（如停转台）在录制结束后才执行。
 - 同步执行时，Django 请求线程会被占用 `duration` 秒；部署若用多 worker，需保证并发数 ≥ 1 个录制请求。
 - actor 是单线程，录制期间不会推进其他实例；这是 v1 接受的限制。
-- 预约实例在录制期间保持 `running`；不支持取消。
+- 预约实例在录制期间保持 `running`；收到中止后流转 `running → cancelling → aborted`（见 action_spec 第 7 节）。
 
 ### 8.3 actions.json 约定
 
@@ -665,6 +695,9 @@ handler 行为：
 8. sidecar 采用原子写：模拟中途失败不留下半个 JSON。
 9. `process.output` 原样保存 dumpcap / tcpdump 的收包与丢包统计文本，不生成 `stats` 子对象；超 16 KB 时截断并置 `output_truncated: true`。
 10. 输出解码为 UTF-8 → GBK → replace；中文网卡名不乱码。
+11. `POST /abort` 空闲时返回 `aborted: false`，不产生 sidecar。
+12. 录制中 `POST /abort` → 子进程终止、sidecar `aborted`、`error.code = recorder_aborted`，pcap 与 `process.output` 保留；daemon 不退出。
+13. `POST /abort` 带不匹配 `record_id` → `409 record_mismatch`，当前录制不受影响。
 
 ### 11.3 重启恢复
 
@@ -678,6 +711,7 @@ handler 行为：
 3. 各 daemon code 映射到约定 `CommandError.code`。
 4. 连接失败 / 超时 → `recorder_unreachable`。
 5. 客户端超时为 `duration + 30`，而不是 `request_timeout_seconds`。
+6. sidecar `status == "aborted"` → handler 抛 `CommandError('recorder_aborted', ...)`。
 
 ### 11.5 web
 
@@ -710,7 +744,7 @@ handler 行为：
 ## 13. 已知限制与后续
 
 - 录制是阻塞步骤：actor 单线程，长录制会推迟其他预约；需要并发时再引入异步记录 ID 机制。
-- 不支持取消正在进行的录制；v1 只能等它自然结束或重启 daemon。
+- 单次录制可中止（`POST /abort`，见 5.8）；不支持暂停、续录，中止不保留为可恢复状态。
 - 只支持单网卡、单雷达；多雷达需要新增 `recorder.targets[]` 配置与多实例状态机。
 - 不解析 pcap 内容，也不把 `process.output` 里的丢包统计结构化；丢包数字仅以工具原始文本保留。
 - 预检到 spawn 之间，雷达仍可能被其他客户端切回待机；v1 不消除该竞态。
