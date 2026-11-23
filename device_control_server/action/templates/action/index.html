@@ -9,20 +9,20 @@
     </section>
   {% endif %}
 
-  <section class="card" id="pending-card">
+  <section class="card" id="instances-card">
     <header class="card-header">
-      <h2>预约队列</h2>
+      <h2>执行状态</h2>
       <button class="op"
-              hx-get="{% url 'action:pending' %}"
-              hx-target="#pending-body"
+              hx-get="{% url 'action:instances' %}"
+              hx-target="#instances-body"
               hx-swap="innerHTML"
               hx-disabled-elt="this">刷新</button>
     </header>
-    <div id="pending-body"
-         hx-get="{% url 'action:pending' %}"
-         hx-trigger="pending-refresh from:body"
+    <div id="instances-body"
+         hx-get="{% url 'action:instances' %}"
+         hx-trigger="instances-refresh from:body"
          hx-swap="innerHTML">
-      {% include "action/_pending.html" %}
+      {% include "action/_instances.html" %}
     </div>
   </section>
 
