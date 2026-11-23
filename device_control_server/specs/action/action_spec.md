@@ -408,13 +408,26 @@ POST http://127.0.0.1:{action.port}/current/abort
 | --- | --- | --- |
 | POST | `/action/instances/<instance_id>/abort` | 中止 running / cancelling 实例，返回状态表片段 |
 
-模板行为：
+**单入口**：中止按钮只放在 `_instances_live.html` 的状态表操作列，与现有「取消」共用同一列、同一套写法。`_instance_result.html` 不加按钮，保持不变。
 
-- `pending`：显示「取消」（沿用现状）。
-- `running`：显示「中止」按钮，`hx-post` 到 abort，`hx-target="#instances-body"`、`hx-swap="innerHTML"`。
-- `cancelling`：显示「中止中」，按钮禁用，不重复发请求。
-- `aborted`：显示「已中止」。
-- 单实例结果页（`_instance_result.html`）同样提供中止入口。
+理由：
+
+1. 状态表覆盖全部实例（立即执行 + 预约执行），页面刷新后仍在；结果页是点击「执行」后的临时面板，刷新即消失。
+2. 结果页每 1 秒轮询自身，从状态表发起的中止会在下一次轮询自然显示为「中止中 / 已中止」，无需第二个按钮。
+3. 只维护一套 `hx-target` 与状态分支，避免两处显示规则漂移。
+
+`_instances_live.html` 操作列行为：
+
+| status | 操作列 |
+| --- | --- |
+| `pending` | 「取消」按钮（现状不变） |
+| `running` | 「中止」按钮，`hx-post` 到 abort，`hx-target="#instances-live"`、`hx-swap="outerHTML"` |
+| `cancelling` | 「中止中」，按钮禁用（`disabled`），不重复发请求 |
+| `aborted` | 「已中止」，无按钮 |
+
+沿用现有写法：`hx-disabled-elt="find button"`（发送期间禁用）、`hx-confirm`（确认后再发）。
+
+`_instance_result.html` 仅需在状态分支里显示 `cancelling` / `aborted` 文案（`status_label` 已覆盖），不改结构、不加 `id`。
 
 recorder web 卡片继续只读，不在 recorder 页面提供中止按钮；中止统一在 action 页发起。
 
@@ -462,8 +475,8 @@ Phase 2 验收不包含 `lidar-refresh`；文档与页面不承诺自动刷新�
 | `daemon/actor.py` | 3 | 状态机加 cleanup 阶段与 `cancel_requested`；新增 `POST /current/abort`；`snapshot` 增加 phase / cleanup 字段 |
 | `action/views.py` | 3 | 新增 `abort` 视图 |
 | `action/urls.py` | 3 | 新增 abort 路由 |
-| `action/templates/action/_instances_live.html` | 3 | `running` 显示中止按钮、`cancelling` 显示中止中 |
-| `action/templates/action/_instance_result.html` | 3 | 中止入口 |
+| `action/templates/action/_instances_live.html` | 3 | 操作列：`running` 显示中止按钮、`cancelling` 显示中止中 |
+| `action/templates/action/_instance_result.html` | 3 | 不改结构；状态文案自动显示 `cancelling` / `aborted` |
 | `actions.json` | 3 | 示例 action 增加 `cleanup` 组 |
 | `recorder/*` | 3 | 见 recorder_spec 5.8（`/abort` 与 `recorder.abort` command） |
 | `specs/action/action_spec.md` | — | 本文件 |
@@ -505,6 +518,7 @@ Phase 2 验收不包含 `lidar-refresh`；文档与页面不承诺自动刷新�
 6. `request_abort`：`pending` → `cancelled`；`running` / `cancelling` → 转发 actor；终态 → 返回错误文案。
 7. 中止不匹配的 `instance_id` → 409，不影响当前实例。
 8. cleanup 阶段 `execute_step` 的 `step_index` / `step_count` 取自 cleanup，不与 steps 混用。
+9. 中止按钮只出现在状态表；`_instance_result.html` 不含按钮，但能在一次轮询内显示「中止中」→「已中止」。
 
 ## 11. 验收标准
 
