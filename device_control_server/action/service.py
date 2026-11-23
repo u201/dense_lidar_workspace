@@ -1,8 +1,8 @@
-"""Action 服务：读取/校验 actions.json，并同步或预约执行 action。
+"""Action 服务：读取/校验 actions.json，并把执行请求落盘为实例。
 
-同步执行与预约执行共用 execute_step，区别只在调度方式：
-- 同步执行：actions.json 模板 + 表单覆盖值，即时解析后一次性执行；
-- 预约执行：解析后的 steps 快照落盘为实例文件，daemon/actor.py 每 tick 推进一步。
+立即执行与预约执行只差 scheduled_at：两者都把解析后的 steps 快照写成
+实例文件，由 daemon/actor.py 每 tick 推进一步；web 请求只创建实例并
+读取状态，不执行 command。
 
 页面上的时间输入按固定 UTC+8 解释，实例文件里的时间一律存 UTC。
 """
@@ -321,67 +321,8 @@ def parse_overrides(post: Mapping[str, str]) -> dict[int, dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# 执行（同步与 actor 共用）
+# 执行（actor 逐 tick 调用 execute_step）
 # ---------------------------------------------------------------------------
-
-def execute_action(action_id: str,
-                   overrides: dict[int, dict[str, str]] | None = None
-                   ) -> dict[str, Any]:
-    """同步执行 action，任一步失败即停止并保留错误。"""
-    actions, file_error = load_actions()
-    if file_error:
-        return _failure_run(action_id, 'actions_file_error', file_error)
-
-    action = next((item for item in actions
-                   if item['action_id'] == action_id), None)
-    if action is None:
-        return _failure_run(action_id, 'action_not_found',
-                            f'action 不存在: {action_id}')
-    if action['errors']:
-        return _failure_run(action_id, 'invalid_action',
-                            '；'.join(action['errors']))
-
-    steps, arg_error = _resolve_steps(action, overrides or {})
-    run = new_run(action_id)
-    execution = {
-        'kind': 'immediate',
-        'instance_id': None,
-        'title': action['title'],
-        'scheduled_at': None,
-        'steps': steps,
-    }
-    succeeded = _run_steps(steps, run, action_id, execution)
-
-    if arg_error and succeeded:
-        # 参数出错的步骤之前都执行成功，把该步骤补记为失败，便于页面定位。
-        run['steps'].append({
-            'index': arg_error['index'],
-            'command': arg_error['command'],
-            'args': arg_error['args'],
-            'status': 'failed',
-            'result': None,
-            'error': {'code': 'invalid_args',
-                      'message': arg_error['message']},
-            'duration_ms': 0,
-        })
-        succeeded = False
-
-    if succeeded and len(run['steps']) == len(action['steps']):
-        run['status'] = 'succeeded'
-    return _finish_run(run)
-
-
-def execute_steps(steps: list[dict[str, Any]],
-                  action_id: str,
-                  execution: dict[str, Any] | None = None
-                  ) -> dict[str, Any]:
-    """同步执行已解析的步骤快照；actor 逐 tick 调用 execute_step。"""
-    run = new_run(action_id)
-    succeeded = _run_steps(steps, run, action_id, execution)
-    if succeeded and len(run['steps']) == len(steps):
-        run['status'] = 'succeeded'
-    return _finish_run(run)
-
 
 def _resolve_steps(action: dict[str, Any],
                    overrides: dict[int, dict[str, str]]
@@ -423,8 +364,8 @@ def execute_step(step: dict[str, Any], run: dict[str, Any],
                  ) -> dict[str, Any]:
     """执行一步并返回结果；异常统一转成 error，不向外抛。
 
-    index 由 run 中已完成的步数决定，因此同步执行与 actor 增量执行
-    可以各自循环调用，步骤编号保持一致。
+    index 由 run 中已完成的步数决定，actor 每 tick 调用一次，步骤编号
+    自然递增。
 
     execution 为执行身份（kind / instance_id / title / scheduled_at /
     已解析 steps）；不传时退化为旧的 {'run_id', 'action_id'} 上下文。
@@ -503,32 +444,6 @@ def _build_step_context(step_index: int, run: dict[str, Any],
             ],
         },
     }
-
-
-def _run_steps(steps: list[dict[str, Any]], run: dict[str, Any],
-               action_id: str,
-               execution: dict[str, Any] | None = None) -> bool:
-    """同步执行全部步骤；delay 在这里阻塞等待，actor 不走这个函数。"""
-    for step in steps:
-        step_run = execute_step(step, run, action_id, execution)
-        run['steps'].append(step_run)
-        if step_run['status'] == 'failed':
-            return False
-        delay = step.get('delay', 0) or 0
-        if delay > 0:
-            time.sleep(delay)
-    return True
-
-
-def _failure_run(action_id: str, code: str, message: str) -> dict[str, Any]:
-    run = new_run(action_id)
-    run['error'] = {'code': code, 'message': message}
-    return _finish_run(run)
-
-
-def _finish_run(run: dict[str, Any]) -> dict[str, Any]:
-    run['finished_at'] = datetime.now(timezone.utc).isoformat()
-    return run
 
 
 def _apply_overrides(definition: dict[str, Any], args: dict[str, Any],
@@ -712,37 +627,40 @@ def mark_superseded(instance: dict[str, Any],
     save_instance(fresh)
 
 
-def schedule_action(action_id: str, raw_scheduled_at: str,
-                    overrides: dict[int, dict[str, str]] | None = None
-                    ) -> tuple[dict[str, Any] | None, str | None]:
-    """校验模板、参数和时间后，落盘一个 pending 实例。"""
-    try:
-        scheduled_at = _parse_scheduled_at(raw_scheduled_at)
-    except ValueError as exc:
-        return None, str(exc)
-
+def _find_action(action_id: str
+                 ) -> tuple[dict[str, Any] | None, str | None]:
     actions, file_error = load_actions()
     if file_error:
         return None, file_error
-
     action = next((item for item in actions
                    if item['action_id'] == action_id), None)
     if action is None:
         return None, f'action 不存在: {action_id}'
     if action['errors']:
         return None, '；'.join(action['errors'])
+    return action, None
 
+
+def _prepare_steps(action: dict[str, Any],
+                   overrides: dict[int, dict[str, str]] | None
+                   ) -> tuple[list[dict[str, Any]] | None, str | None]:
     steps, arg_error = _resolve_steps(action, overrides or {})
     if arg_error:
         return None, (f'step {arg_error["index"]} 参数错误: '
                       f'{arg_error["message"]}')
+    return steps, None
 
-    created_at = datetime.now(timezone.utc)
+
+def _create_instance(action: dict[str, Any], steps: list[dict[str, Any]],
+                     scheduled_at: datetime, kind: str,
+                     created_at: datetime | None = None) -> dict[str, Any]:
+    created_at = created_at or datetime.now(timezone.utc)
     instance = {
         # 只用数字时间戳：INSTANCE_ID_RE 仅允许小写，避免 ISO 的 T/Z 大写。
-        'instance_id': f'{action_id}-{created_at:%Y%m%d%H%M%S%f}',
-        'action_id': action_id,
+        'instance_id': f'{action["action_id"]}-{created_at:%Y%m%d%H%M%S%f}',
+        'action_id': action['action_id'],
         'title': action['title'],
+        'kind': kind,
         'scheduled_at': iso_utc(scheduled_at),
         'expire_after_seconds': get_expire_after_seconds(),
         'status': 'pending',
@@ -754,33 +672,43 @@ def schedule_action(action_id: str, raw_scheduled_at: str,
         'error': None,
     }
     save_instance(instance)
+    return instance
 
+
+def submit_action(action_id: str,
+                  overrides: dict[int, dict[str, str]] | None = None
+                  ) -> tuple[dict[str, Any] | None, str | None]:
+    """立即执行：创建 scheduled_at=now 的实例，由 actor 下一 tick 启动。"""
+    action, error = _find_action(action_id)
+    if error:
+        return None, error
+    steps, error = _prepare_steps(action, overrides)
+    if error:
+        return None, error
+    now = datetime.now(timezone.utc)
+    return _create_instance(action, steps, now, 'immediate', now), None
+
+
+def schedule_action(action_id: str, raw_scheduled_at: str,
+                    overrides: dict[int, dict[str, str]] | None = None
+                    ) -> tuple[dict[str, Any] | None, str | None]:
+    """校验模板、参数和时间后，落盘一个 pending 实例。"""
+    try:
+        scheduled_at = _parse_scheduled_at(raw_scheduled_at)
+    except ValueError as exc:
+        return None, str(exc)
+
+    action, error = _find_action(action_id)
+    if error:
+        return None, error
+    steps, error = _prepare_steps(action, overrides)
+    if error:
+        return None, error
+
+    instance = _create_instance(action, steps, scheduled_at, 'scheduled')
     result = dict(instance)
     result['scheduled_local'] = _format_local(instance['scheduled_at'])
     return result, None
-
-
-def list_pending_instances() -> list[dict[str, Any]]:
-    """页面展示用：已预约、未执行且未失效，按计划时间排序。"""
-    now = datetime.now(timezone.utc)
-    pending = []
-    for instance in iter_instances('pending'):
-        try:
-            scheduled_at = parse_utc(instance['scheduled_at'])
-            created_at = parse_utc(instance['created_at'])
-        except (KeyError, TypeError, ValueError):
-            continue
-        expire_after = instance.get('expire_after_seconds',
-                                    get_expire_after_seconds())
-        if now - scheduled_at > timedelta(seconds=expire_after):
-            continue
-        item = dict(instance)
-        item['scheduled_local'] = _format_local(instance['scheduled_at'])
-        item['created_local'] = _format_local(instance['created_at'])
-        pending.append(item)
-    pending.sort(key=lambda item: (parse_utc(item['scheduled_at']),
-                                   parse_utc(item['created_at'])))
-    return pending
 
 
 # ---------------------------------------------------------------------------
