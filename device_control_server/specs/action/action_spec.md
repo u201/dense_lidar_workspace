@@ -374,7 +374,9 @@ actor 执行分两个阶段：
 | 全成功 | 有失败 | 否 | `failed`，`error.code = "cleanup_failed"`，cleanup 错误记入 `run` |
 | 失败 | 已执行 | 否 | `failed`，保留 steps 原始错误，cleanup 错误附加在 `run` |
 | 任意 | 已执行 | 是 | `aborted`；cleanup 仍执行完，cleanup 错误附加在 `run`，不覆盖中止结论 |
-|}
+
+中止时的判定不看错误码：只要 `cancel_requested` 为真，正在执行的步骤无论返回什么错误，都视为中止导致，记录到 `run` 后进入 cleanup，最终落 `aborted`。不依赖 `recorder_aborted` 这类具体字符串，新增命令无需让 actor 认识它的错误码。
+
 ### 7.3 中止入口：`POST /current/abort`
 
 actor 新增本地 HTTP 端点（仅回环）：
@@ -388,11 +390,34 @@ POST http://127.0.0.1:{action.port}/current/abort
 
 1. 校验 `current` 非空且 `current.instance_id == 请求 instance_id`；不匹配 → `409`，`{ok: false, error: {...}}`。
 2. 设置 `current.cancel_requested = true`，把实例文件 `status` 写为 `cancelling`。
-3. **立即**调用注册表里的 `recorder.abort`（不传 `record_id`，中止当前唯一录制；见 recorder_spec 5.8），打断阻塞中的 `recorder.record`。这是必须的快路径：actor 主循环卡在阻塞步骤里，只有 HTTP 线程能打断它。
-4. 返回 `202 {ok: true}`，不等待 cleanup 完成。
-5. 后续 tick：阻塞步骤返回后，跳过剩余 steps，进入 cleanup；cleanup 完成后落盘 `aborted`。
+3. **立即**执行通用中断：取当前步骤的 `command` → 查注册表定义里的可选字段 `abort` → 存在则调用该命令的 handler，打断阻塞中的步骤。这是必须的快路径：actor 主循环卡在阻塞步骤里，只有 HTTP 线程能打断它。
+4. 当前步骤没有声明 `abort`（或不支持中断）→ 只保留 `cancel_requested` 标志，不做中断调用；步骤返回后跳过剩余 steps。
+5. 返回 `202 {ok: true}`，不等待 cleanup 完成。
+6. 后续 tick：阻塞步骤返回后，跳过剩余 steps，进入 cleanup；cleanup 完成后落盘 `aborted`。
 
-并发安全：`current` 与实例落盘由同一把锁保护；**不在 command handler 执行期间持锁**，避免 HTTP 线程死锁。对不支持中止的 command，只能协作式取消（标记 `cancel_requested`，等当前 handler 返回后跳过剩余 steps），不承诺所有命令都能立即终止。
+并发安全：`current` 与实例落盘由同一把锁保护；**不在 command handler 执行期间持锁**，避免 HTTP 线程死锁。
+
+#### 7.3.1 命令中断声明契约
+
+任何命令都可以选择支持中止，只需在自己的 `COMMANDS` 定义里加一个可选字段：
+
+```python
+'recorder.record': {
+    'abort': 'recorder.abort',   # 中断本命令时调用的命令名
+    ...
+}
+```
+
+约束：
+
+1. `abort` 是**命令名字符串**，不是 handler；actor 通过注册表解析，避免直接 import 具体模块。
+2. 中断命令的 handler 签名为 `handler(args, ctx)`，actor 以 `({}, {})` 调用；因此中断 handler **不得依赖 `ctx` 里的执行上下文**，也不得要求 `step_index` / `step_count`。
+3. 中断 handler 必须幂等：没有可中止的目标时返回成功，不抛错。
+4. 中断 handler 必须有内部超时，不能长时间阻塞调用它的 HTTP 线程。
+5. `registry.get_registry()` 加载时校验：每处声明的 `abort` 命令必须存在，否则视为配置错误，启动即失败。
+6. 未声明 `abort` 的命令按协作式取消处理：置标志、等返回、跳过剩余 steps。
+
+新增一个「阻塞且支持 abort」的命令时，只需在自己模块的 `COMMANDS` 中声明 `abort` 并注册中断命令，`action` / actor 不再改动。
 
 `action/service.py` 新增 `request_abort(instance_id)`：
 
@@ -472,7 +497,8 @@ Phase 2 验收不包含 `lidar-refresh`；文档与页面不承诺自动刷新�
 | `action/templates/action/_instance_result.html` | 2 | 新建，单实例结果与轮询 |
 | `daemon/actor.py` | 2 | `_advance` 读取实例 `kind` |
 | `action/service.py` | 3 | `_normalize_action` 解析 `cleanup`；`_create_instance` 写入 cleanup 快照；新增 `request_abort`；状态常量加 `cancelling` / `aborted` |
-| `daemon/actor.py` | 3 | 状态机加 cleanup 阶段与 `cancel_requested`；新增 `POST /current/abort`；`snapshot` 增加 phase / cleanup 字段 |
+| `action/registry.py` | 3 | 加载时校验命令声明的 `abort` 存在；提供按命令名取中断定义 |
+| `daemon/actor.py` | 3 | 状态机加 cleanup 阶段与 `cancel_requested`；新增 `POST /current/abort`（按当前 command 的 `abort` 声明通用中断）；`snapshot` 增加 phase / cleanup 字段 |
 | `action/views.py` | 3 | 新增 `abort` 视图 |
 | `action/urls.py` | 3 | 新增 abort 路由 |
 | `action/templates/action/_instances_live.html` | 3 | 操作列：`running` 显示中止按钮、`cancelling` 显示中止中 |
@@ -519,6 +545,9 @@ Phase 2 验收不包含 `lidar-refresh`；文档与页面不承诺自动刷新�
 7. 中止不匹配的 `instance_id` → 409，不影响当前实例。
 8. cleanup 阶段 `execute_step` 的 `step_index` / `step_count` 取自 cleanup，不与 steps 混用。
 9. 中止按钮只出现在状态表；`_instance_result.html` 不含按钮，但能在一次轮询内显示「中止中」→「已中止」。
+10. 通用中断：当前步骤声明 `abort` → 快路径调用该中断命令；未声明 → 只置标志、不调用、不报错。
+11. `abort` 声明指向不存在的命令 → `get_registry()` 加载失败。
+12. `cancel_requested` 为真时，当前步骤返回任意错误码都进入 cleanup 且终态为 `aborted`，不需要 actor 认识具体错误码。
 
 ## 11. 验收标准
 
