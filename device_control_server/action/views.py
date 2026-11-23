@@ -39,8 +39,10 @@ def instances_live(request: HttpRequest) -> HttpResponse:
 
 
 def _result_context(instance: dict | None, error: str | None) -> dict:
+    live = (service.current_snapshot()
+            if instance and instance.get('status') == 'running' else None)
     return {
-        'instance': service.instance_view(instance) if instance else None,
+        'instance': service.instance_view(instance, live) if instance else None,
         'error': error,
     }
 
