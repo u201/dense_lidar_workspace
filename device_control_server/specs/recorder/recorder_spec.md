@@ -403,7 +403,7 @@ POST http://{recorder.device_ip}:{recorder.port}/abort
 
 `GET /status` 不受影响，录制中仍返回 `recording`。
 
-action 通过 `recorder.abort` command 调用本端点（cleanup 组可用）；`recorder.record` handler 收到 `status == "aborted"` 的 sidecar 时，抛出 `CommandError('recorder_aborted', ...)`，使 actor 把该步骤记为失败并进入 cleanup（见 action_spec 第 7 节）。
+action 通过 `recorder.abort` command 调用本端点（cleanup 组可用，actor 中止快路径也调用它）。`recorder.record` handler 收到 `status == "aborted"` 的 sidecar 时抛 `CommandError('recorder_aborted', ...)`，仅用于让步骤错误可读；actor 是否中止由 `cancel_requested` 判定，不看这个错误码（见 action_spec 7.2 / 7.3.1）。
 
 ## 6. `recorder` Django app
 
@@ -504,9 +504,12 @@ COMMANDS = {
             'help': '录制期间该步骤阻塞，结束后才执行后续步骤',
         }],
         'handler': record,
+        'abort': 'recorder.abort',   # 阻塞期间的中断命令，见 action_spec 7.3.1
     },
 }
 ```
+
+`abort` 是 `action.registry` 的通用中断声明：actor 中止时按当前步骤的 command 查出这个命令名并调用，因此新增中断能力不需要改 actor。中断 handler 以 `({}, {})` 调用，不依赖执行上下文，且必须幂等、自带超时。
 
 handler 行为：
 
@@ -545,7 +548,13 @@ handler 行为：
 
 #### `recorder.abort`
 
-（Phase 3 新增）调用 daemon `POST /abort`；参数可选 `record_id`。空闲时 no-op 返回成功，不抛错；`record_id` 不匹配抛 `CommandError('record_mismatch', ...)`。用于 action 的 cleanup 组与 actor 中止快路径（见 action_spec 第 7 节）。
+（Phase 3 新增）调用 daemon `POST /abort`；参数可选 `record_id`。空闲时 no-op 返回成功，不抛错；`record_id` 不匹配抛 `CommandError('record_mismatch', ...)`。
+
+- handler 签名 `abort(args, ctx)`，**不读取 `ctx`**，不校验 `step_index` / `step_count`；actor 以 `({}, {})` 直接调用。
+- 必须幂等、有内部超时（沿用 `request_timeout_seconds`），不能阻塞调用方 HTTP 线程。
+- `recorder.record` 的 `abort` 声明指向本命令；cleanup 组也可直接写 `{"command": "recorder.abort", "args": {}}`。
+
+`recorder_aborted` 只用于让步骤错误可读，**不参与 actor 的控制流**：actor 以 `cancel_requested` 判定中止，不依赖该字符串。
 
 ## 8. 与 action 的契约
 
