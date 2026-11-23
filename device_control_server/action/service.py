@@ -33,7 +33,6 @@ INPUT_TZ = timezone(timedelta(hours=8))
 CONFIG_PATH = Path(settings.BASE_DIR) / 'device_config.json'
 DEFAULT_INSTANCE_DIR = 'action_instances'
 DEFAULT_EXPIRE_SECONDS = 600
-DEFAULT_ACTOR_HTTP_PORT = 8
 
 # 单步 delay 上限：防止一个等待把 actor 的调度拖得过长。
 MAX_DELAY_SECONDS = 600
@@ -489,11 +488,16 @@ def _coerce_form_value(param: dict[str, Any], raw: str) -> tuple[Any, str | None
 # 预约实例
 # ---------------------------------------------------------------------------
 
+class ActionConfigError(Exception):
+    """action 段配置缺失或非法。"""
+
+
 def load_action_config() -> dict[str, Any]:
     """读取 device_config.json 的 action 段。
 
     action_instance_dir 为相对路径时，按 device_config.json 所在目录解析
-    （即 BASE_DIR）；绝对路径直接使用。字段缺失或非法时回退默认值，
+    （即 BASE_DIR）；绝对路径直接使用。port 为 actor 状态接口端口，
+    缺失或非法时抛 ActionConfigError；其余字段缺失或非法时回退默认值，
     避免单点配置错误导致整个预约功能不可用。
     """
     try:
@@ -517,10 +521,10 @@ def load_action_config() -> dict[str, Any]:
     if isinstance(expire, bool) or not isinstance(expire, int) or expire <= 0:
         expire = DEFAULT_EXPIRE_SECONDS
 
-    http_port = section.get('actor_http_port', DEFAULT_ACTOR_HTTP_PORT)
+    http_port = section.get('port')
     if (isinstance(http_port, bool) or not isinstance(http_port, int)
             or not 1 <= http_port <= 65535):
-        http_port = DEFAULT_ACTOR_HTTP_PORT
+        raise ActionConfigError('action.port 必须是 1-65535 的整数')
 
     return {
         'instance_dir': instance_dir,
