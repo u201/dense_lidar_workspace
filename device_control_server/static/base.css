@@ -32,6 +32,9 @@ body {
   .grid { grid-template-columns: 1fr; }
 }
 
+/* 门户：容器内的卡片直接成为栅格子项 */
+.contents { display: contents; }
+
 .card {
   background: var(--card-bg);
   border: 1px solid var(--border);
