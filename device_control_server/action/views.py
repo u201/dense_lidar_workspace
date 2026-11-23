@@ -31,20 +31,34 @@ def instances(request: HttpRequest) -> HttpResponse:
     return render(request, 'action/_instances.html', _instances_context())
 
 
+def _result_context(instance: dict | None, error: str | None) -> dict:
+    return {
+        'instance': service.instance_view(instance) if instance else None,
+        'error': error,
+    }
+
+
 @require_http_methods(['POST'])
 def run(request: HttpRequest, action_id: str) -> HttpResponse:
-    """POST /action/<id>/run —— 同步执行，仅替换卡片内结果区。"""
-    result = service.execute_action(
+    """POST /action/<id>/run —— 创建立即执行实例，结果区轮询到终态。"""
+    instance, error = service.submit_action(
         action_id, service.parse_overrides(request.POST))
-    succeeded = result['status'] == 'succeeded'
-    result['status_label'] = '执行成功' if succeeded else '执行失败'
-    result['status_class'] = 'ok' if succeeded else 'abnormal'
 
-    response = render(request, 'action/_run_result.html', {'run': result})
-    if succeeded:
-        # 同屏存在 lidar 卡片时实时刷新；没有该卡片时事件自然无效
-        response['HX-Trigger'] = 'lidar-refresh'
+    response = render(request, 'action/_instance_result.html',
+                      _result_context(instance, error))
+    if instance is not None:
+        # 执行状态卡片监听该事件，局部刷新
+        response['HX-Trigger'] = 'instances-refresh'
     return response
+
+
+@require_http_methods(['GET'])
+def instance_result(request: HttpRequest, instance_id: str) -> HttpResponse:
+    """GET /action/instances/<id>/result —— 单实例结果轮询。"""
+    instance = service.load_instance(instance_id)
+    error = None if instance is not None else '实例不存在'
+    return render(request, 'action/_instance_result.html',
+                  _result_context(instance, error))
 
 
 @require_http_methods(['POST'])
