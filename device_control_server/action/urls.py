@@ -8,6 +8,7 @@ app_name = 'action'
 
 urlpatterns = [
     path('', views.index, name='index'),
+    path('frag/card', views.card, name='card'),
     path('instances', views.instances, name='instances'),
     path('instances/live', views.instances_live, name='instances_live'),
     path('instances/<str:instance_id>/result',
