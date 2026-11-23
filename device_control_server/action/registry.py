@@ -11,6 +11,7 @@ from typing import Any
 COMMAND_MODULES = (
     'lidar.commands',
     'recorder.commands',
+    'turntable.commands',
 )
 
 
