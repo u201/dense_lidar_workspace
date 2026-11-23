@@ -13,6 +13,7 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,23 +46,27 @@ CURRENT_TIMEOUT_SECONDS = 0.5
 STATUS_LABELS = {
     'pending': '等待执行',
     'running': '执行中',
+    'cancelling': '中止中',
     'succeeded': '成功',
     'failed': '失败',
     'expired': '已过期',
     'superseded': '被覆盖',
     'cancelled': '已取消',
+    'aborted': '已中止',
 }
 STATUS_CLASSES = {
     'pending': 'offline',
     'running': 'running',
+    'cancelling': 'running',
     'succeeded': 'ok',
     'failed': 'abnormal',
     'expired': 'abnormal',
     'superseded': 'abnormal',
     'cancelled': 'offline',
+    'aborted': 'abnormal',
 }
 TERMINAL_STATUSES = frozenset(
-    {'succeeded', 'failed', 'expired', 'superseded', 'cancelled'})
+    {'succeeded', 'failed', 'expired', 'superseded', 'cancelled', 'aborted'})
 
 # 执行状态区保留的已完成实例条数；进行中的实例全部展示。
 INSTANCE_HISTORY_LIMIT = 20
@@ -142,6 +147,7 @@ def _normalize_action(raw_action: Any, index: int,
             'title': f'Action #{index + 1}',
             'description': '',
             'steps': [],
+            'cleanup': [],
             'errors': ['action 必须是对象'],
         }
 
@@ -171,11 +177,25 @@ def _normalize_action(raw_action: Any, index: int,
             steps.append(step)
             errors.extend(step_errors)
 
+    # cleanup 可选：缺失或空数组都合法，元素结构与 steps 一致。
+    cleanup: list[dict[str, Any]] = []
+    raw_cleanup = raw_action.get('cleanup')
+    if raw_cleanup is not None:
+        if not isinstance(raw_cleanup, list):
+            errors.append('cleanup 必须是数组')
+        else:
+            for cleanup_index, raw_step in enumerate(raw_cleanup):
+                step, step_errors = _normalize_step(
+                    raw_step, cleanup_index, registry)
+                cleanup.append(step)
+                errors.extend(f'cleanup {error}' for error in step_errors)
+
     return {
         'action_id': action_id,
         'title': title.strip(),
         'description': description,
         'steps': steps,
+        'cleanup': cleanup,
         'errors': errors,
     }
 
@@ -354,23 +374,28 @@ def new_run(action_id: str) -> dict[str, Any]:
         'started_at': started_at.isoformat(),
         'finished_at': None,
         'steps': [],
+        'cleanup': [],
         'error': None,
     }
 
 
 def execute_step(step: dict[str, Any], run: dict[str, Any],
                  action_id: str,
-                 execution: dict[str, Any] | None = None
+                 execution: dict[str, Any] | None = None,
+                 step_index: int | None = None,
+                 step_count: int | None = None
                  ) -> dict[str, Any]:
     """执行一步并返回结果；异常统一转成 error，不向外抛。
 
-    index 由 run 中已完成的步数决定，actor 每 tick 调用一次，步骤编号
-    自然递增。
+    step_index / step_count 由调用方按阶段显式传入：steps 阶段用 steps
+    的索引与总数，cleanup 阶段用 cleanup 的索引与总数。不传时退化为
+    旧行为（index 取 run['steps'] 已完成步数）。
 
     execution 为执行身份（kind / instance_id / title / scheduled_at /
     已解析 steps）；不传时退化为旧的 {'run_id', 'action_id'} 上下文。
     """
-    step_index = len(run['steps'])
+    if step_index is None:
+        step_index = len(run['steps'])
     step_run = {
         'index': step_index,
         'command': step['command'],
@@ -388,7 +413,8 @@ def execute_step(step: dict[str, Any], run: dict[str, Any],
                                f'command 已不在注册表: {step["command"]}')
         step_run['result'] = definition['handler'](
             step['args'],
-            _build_step_context(step_index, run, action_id, execution))
+            _build_step_context(step_index, run, action_id, execution,
+                                step_count))
     except CommandError as exc:
         step_run['status'] = 'failed'
         step_run['error'] = {
@@ -408,7 +434,8 @@ def execute_step(step: dict[str, Any], run: dict[str, Any],
 
 def _build_step_context(step_index: int, run: dict[str, Any],
                         action_id: str,
-                        execution: dict[str, Any] | None) -> dict[str, Any]:
+                        execution: dict[str, Any] | None,
+                        step_count: int | None = None) -> dict[str, Any]:
     """构造传给 command handler 的上下文。
 
     action 快照里的 steps 是已解析值（含表单覆盖），step_index 在 handler
@@ -418,7 +445,8 @@ def _build_step_context(step_index: int, run: dict[str, Any],
         return {'run_id': run['run_id'], 'action_id': action_id}
 
     steps = execution.get('steps') or []
-    step_count = len(steps)
+    if step_count is None:
+        step_count = len(steps)
     return {
         'run_id': run['run_id'],
         'action_id': action_id,
@@ -651,7 +679,14 @@ def _prepare_steps(action: dict[str, Any],
     return steps, None
 
 
+def _prepare_cleanup(action: dict[str, Any]) -> list[dict[str, Any]]:
+    """cleanup 只用定义值，不接受表单覆盖。"""
+    cleanup, _ = _resolve_steps({'steps': action.get('cleanup') or []}, {})
+    return cleanup
+
+
 def _create_instance(action: dict[str, Any], steps: list[dict[str, Any]],
+                     cleanup: list[dict[str, Any]],
                      scheduled_at: datetime, kind: str,
                      created_at: datetime | None = None) -> dict[str, Any]:
     created_at = created_at or datetime.now(timezone.utc)
@@ -668,6 +703,7 @@ def _create_instance(action: dict[str, Any], steps: list[dict[str, Any]],
         'started_at': None,
         'finished_at': None,
         'steps': steps,
+        'cleanup': cleanup,
         'run': None,
         'error': None,
     }
@@ -686,7 +722,8 @@ def submit_action(action_id: str,
     if error:
         return None, error
     now = datetime.now(timezone.utc)
-    return _create_instance(action, steps, now, 'immediate', now), None
+    return _create_instance(action, steps, _prepare_cleanup(action),
+                            now, 'immediate', now), None
 
 
 def schedule_action(action_id: str, raw_scheduled_at: str,
@@ -705,7 +742,8 @@ def schedule_action(action_id: str, raw_scheduled_at: str,
     if error:
         return None, error
 
-    instance = _create_instance(action, steps, scheduled_at, 'scheduled')
+    instance = _create_instance(action, steps, _prepare_cleanup(action),
+                                scheduled_at, 'scheduled')
     result = dict(instance)
     result['scheduled_local'] = _format_local(instance['scheduled_at'])
     return result, None
@@ -775,9 +813,11 @@ def instance_view(instance: dict[str, Any],
     terminal = status in TERMINAL_STATUSES
     steps = instance.get('steps') or []
     run = instance.get('run') or {}
+    phase = None
 
     if not terminal and _live_matches(live, instance):
         run = live.get('run') or run
+        phase = live.get('phase')
         total = live.get('total_steps')
         total = total if isinstance(total, int) else len(steps)
         done = live.get('next_index')
@@ -789,8 +829,10 @@ def instance_view(instance: dict[str, Any],
         wait_until = None
 
     done = max(0, min(done, total))
+    # cleanup 阶段不再提示“下一步 steps 命令”，避免显示被跳过的步骤。
     pending_command = (steps[done].get('command')
-                       if status == 'running' and done < len(steps) else None)
+                       if (status == 'running' and phase != 'cleanup'
+                           and done < len(steps)) else None)
 
     now = datetime.now(timezone.utc)
     waiting = False
@@ -871,3 +913,50 @@ def cancel_instance(instance_id: str) -> str | None:
     instance['finished_at'] = iso_utc(datetime.now(timezone.utc))
     save_instance(instance)
     return None
+
+
+def _post_abort(instance_id: str, port: int) -> tuple[bool, str | None]:
+    """调用 actor POST /current/abort，返回 (是否成功, 错误文案)。"""
+    body = json.dumps({'instance_id': instance_id}).encode('utf-8')
+    request = urllib.request.Request(
+        f'http://127.0.0.1:{port}/current/abort', data=body, method='POST',
+        headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(
+                request, timeout=CURRENT_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as exc:
+        # 409 等错误响应仍带 JSON 文案，读取后原样交给页面。
+        try:
+            payload = json.loads(exc.read().decode('utf-8'))
+        except (OSError, ValueError):
+            payload = None
+    except (OSError, ValueError) as exc:
+        return False, f'无法连接 actor 中止执行: {exc}'
+
+    if isinstance(payload, dict) and payload.get('ok') is True:
+        return True, None
+    error = payload.get('error') if isinstance(payload, dict) else None
+    message = error.get('message') if isinstance(error, dict) else None
+    return False, message or 'actor 拒绝了中止请求'
+
+
+def request_abort(instance_id: str) -> str | None:
+    """中止实例：pending 转为取消，running / cancelling 转发 actor。"""
+    instance = load_instance(instance_id)
+    if instance is None:
+        return '实例不存在'
+
+    status = instance.get('status')
+    if status == 'pending':
+        return cancel_instance(instance_id)
+    if status not in ('running', 'cancelling'):
+        return '实例已结束，无法中止'
+
+    try:
+        port = load_action_config()['http_port']
+    except ActionConfigError:
+        return 'action.port 配置缺失，无法中止'
+
+    ok, message = _post_abort(instance_id, port)
+    return None if ok else message
