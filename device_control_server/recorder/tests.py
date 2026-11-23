@@ -34,7 +34,6 @@ RECORDER_CONFIG = {
     'interface': 'WLAN 2',
     'udp_port': 2368,
     'port': 6,
-    'device_ip': '127.0.0.1',
     'timeout': 1.5,
     'dumpcap_path': None,
 }
@@ -43,7 +42,6 @@ RECORDER_SECTION = {
     service.platform_interface_key(): 'WLAN 2',
     'udp_port': 2368,
     'port': 6,
-    'device_ip': '127.0.0.1',
     'request_timeout_seconds': 1.5,
 }
 
@@ -152,16 +150,6 @@ class RecorderConfigTests(SimpleTestCase):
         cfg = self._load(dict(RECORDER_SECTION))
         self.assertEqual(cfg['interface'], 'WLAN 2')
         self.assertEqual(cfg['port'], 6)
-
-    def test_non_loopback_device_ip_rejected(self):
-        section = dict(RECORDER_SECTION, device_ip='192.168.0.1')
-        with self.assertRaises(service.RecorderConfigError):
-            self._load(section)
-
-    def test_non_loopback_hostname_rejected(self):
-        section = dict(RECORDER_SECTION, device_ip='localhost')
-        with self.assertRaises(service.RecorderConfigError):
-            self._load(section)
 
     def test_missing_interface_rejected(self):
         section = dict(RECORDER_SECTION)
