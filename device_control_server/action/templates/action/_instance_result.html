@@ -27,5 +27,17 @@
         <p class="folder">{{ step.result }}</p>
       {% endif %}
     {% endfor %}
+    {% if instance.run.cleanup %}
+      <p class="folder">cleanup</p>
+      {% for step in instance.run.cleanup %}
+        <p>步骤 {{ step.index }} · {{ step.command }} · {{ step.status }} · {{ step.duration_ms }} ms</p>
+        {% if step.error %}
+          <p class="banner error">{{ step.error.code }}: {{ step.error.message }}</p>
+        {% endif %}
+        {% if step.result %}
+          <p class="folder">{{ step.result }}</p>
+        {% endif %}
+      {% endfor %}
+    {% endif %}
   {% endif %}
 </div>
