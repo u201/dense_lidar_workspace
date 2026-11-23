@@ -16,13 +16,17 @@ def _instances_context(error: str | None = None) -> dict:
     }
 
 
-@require_http_methods(['GET'])
-def index(request: HttpRequest) -> HttpResponse:
-    """GET /action/ —— 首屏直接渲染全部 action 卡片与执行状态。"""
+def _index_context() -> dict:
     actions, file_error = service.load_actions()
     context = _instances_context()
     context.update({'actions': actions, 'file_error': file_error})
-    return render(request, 'action/index.html', context)
+    return context
+
+
+@require_http_methods(['GET'])
+def index(request: HttpRequest) -> HttpResponse:
+    """GET /action/ —— 首屏直接渲染全部 action 卡片与执行状态。"""
+    return render(request, 'action/index.html', _index_context())
 
 
 @require_http_methods(['GET'])
