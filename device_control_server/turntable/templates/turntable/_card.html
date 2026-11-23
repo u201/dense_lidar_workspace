@@ -1,0 +1,18 @@
+{# 卡片外壳：门户 include 它；永不整体替换，只有 #turntable-body 会被片段刷新 #}
+<section class="card" id="turntable-card"
+         hx-get="{% url 'turntable:card' %}"
+         hx-trigger="turntable-refresh from:body"
+         hx-target="#turntable-body"
+         hx-swap="innerHTML">
+  <header class="card-header">
+    <h2>Turntable</h2>
+    <button class="op"
+            hx-get="{% url 'turntable:card' %}"
+            hx-target="#turntable-body"
+            hx-swap="innerHTML"
+            hx-disabled-elt="this">刷新</button>
+  </header>
+  <div id="turntable-body">
+    {% include "turntable/_card_body.html" %}
+  </div>
+</section>
