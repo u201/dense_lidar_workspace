@@ -437,6 +437,27 @@ class Recorder:
             'elapsed_seconds': round(elapsed, 3),
         }
 
+    def abort(self, record_id: Any = None) -> dict[str, Any]:
+        """中止当前录制；空闲时幂等 no-op，record_id 不匹配直接拒绝。"""
+        current = self.current
+        if current is None:
+            return {'ok': True, 'aborted': False}
+        if record_id is not None:
+            if not isinstance(record_id, str):
+                raise RecorderRequestError(
+                    400, 'invalid_request', 'record_id 必须是字符串')
+            if record_id != current['record_id']:
+                raise RecorderRequestError(
+                    409, 'record_mismatch',
+                    f'当前录制为 {current["record_id"]}，与请求不匹配')
+
+        current['abort_requested'] = True
+        proc = current.get('process')
+        if proc is not None and proc.poll() is None:
+            logger.info('aborting capture process %s', proc.pid)
+            proc.terminate()
+        return {'ok': True, 'aborted': True}
+
     def record(self, duration: Any, action: Any) -> dict[str, Any]:
         if not self._record_lock.acquire(blocking=False):
             raise RecorderRequestError(409, 'recorder_busy', '已有录制在进行')
@@ -480,7 +501,7 @@ class Recorder:
         }
         write_sidecar(sidecar_path, record)
 
-        self.current = {
+        self.current = current = {
             'record_id': record_id,
             'pcap_path': pcap_path,
             'sidecar_path': sidecar_path,
@@ -488,6 +509,7 @@ class Recorder:
             'started_at': started_at,
             'started_at_iso': record['started_at'],
             'duration': ctx['duration'],
+            'abort_requested': False,
         }
 
         try:
@@ -516,7 +538,10 @@ class Recorder:
                     raise RecorderRequestError(422, code, record['error']['message'])
                 return record
 
-            self.current['process'] = proc
+            current['process'] = proc
+            # 预检期间到达的中止请求：进程一启动就立即终止。
+            if current['abort_requested'] and proc.poll() is None:
+                proc.terminate()
             output, truncated = _read_output(proc)
             returncode = proc.wait()
 
@@ -528,7 +553,15 @@ class Recorder:
             record['process']['output_truncated'] = truncated
 
             success_codes = SUCCESS_RETURNCODES.get(sys.platform, (0, 124))
-            if self._stop.is_set() and returncode != 0:
+            # 中止优先判定：避免被「返回码非 0 / pcap 为空」覆盖成失败。
+            if current['abort_requested']:
+                record['status'] = 'aborted'
+                record['error'] = {
+                    'code': 'recorder_aborted',
+                    'message': '录制被中止',
+                    'detail': {},
+                }
+            elif self._stop.is_set() and returncode != 0:
                 record['status'] = 'failed'
                 record['error'] = {
                     'code': 'daemon_stopped',
@@ -570,9 +603,14 @@ class _RecorderHandler(BaseHTTPRequestHandler):
         self._send_json(200, self.recorder.snapshot())
 
     def do_POST(self) -> None:
-        if self.path != '/record':
+        if self.path == '/record':
+            self._handle_record()
+        elif self.path == '/abort':
+            self._handle_abort()
+        else:
             self.send_error(404)
-            return
+
+    def _handle_record(self) -> None:
         try:
             payload = self._read_json()
         except ValueError as exc:
@@ -605,12 +643,46 @@ class _RecorderHandler(BaseHTTPRequestHandler):
 
         self._send_json(200, {'ok': True, 'record': record})
 
-    def _read_json(self) -> dict[str, Any]:
+    def _handle_abort(self) -> None:
+        try:
+            payload = self._read_json(allow_empty=True)
+        except ValueError as exc:
+            self._send_json(400, {
+                'ok': False,
+                'error': {'code': 'invalid_request', 'message': str(exc)},
+            })
+            return
+
+        try:
+            result = self.recorder.abort(payload.get('record_id'))
+        except RecorderRequestError as exc:
+            self._send_json(exc.http_status, {
+                'ok': False,
+                'error': {
+                    'code': exc.code,
+                    'message': exc.message,
+                    'detail': exc.detail,
+                },
+            })
+            return
+        except Exception as exc:  # 单次请求异常不能拖垮守护进程
+            logger.exception('abort failed')
+            self._send_json(500, {
+                'ok': False,
+                'error': {'code': 'internal_error', 'message': str(exc)},
+            })
+            return
+
+        self._send_json(200, result)
+
+    def _read_json(self, allow_empty: bool = False) -> dict[str, Any]:
         try:
             length = int(self.headers.get('Content-Length') or 0)
         except ValueError:
             raise ValueError('Content-Length 非法')
         if length <= 0:
+            if allow_empty:
+                return {}
             raise ValueError('请求体为空')
         if length > MAX_REQUEST_BYTES:
             raise ValueError(f'请求体超过 {MAX_REQUEST_BYTES} 字节')
