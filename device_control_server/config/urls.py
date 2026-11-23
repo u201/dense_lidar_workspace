@@ -25,4 +25,5 @@ urlpatterns = [
     path('lidar/', include('lidar.urls')),
     path('action/', include('action.urls')),
     path('recorder/', include('recorder.urls')),
+    path('turntable/', include('turntable.urls')),
 ]
