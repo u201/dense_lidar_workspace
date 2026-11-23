@@ -1,0 +1,391 @@
+# Action 执行实例 Specification
+
+## 1. 目标
+
+让 action 的执行过程在 web 上可见，并把「立即执行」统一成实例 + actor 调度：
+
+1. **Phase 1**：web 新增执行状态区，能看到预约排队、执行中进度、最近完成结果。**不修改 `daemon/actor.py`**，执行中进度来自 actor 的 `GET /current`，其余状态来自实例文件。
+2. **Phase 2**：`POST /action/<id>/run` 不再在请求线程里同步执行，而是创建 `scheduled_at = now` 的实例，由 actor 执行；同时删除 `action/service.py` 里的同步执行代码。
+3. 保持现有文件契约：实例仍落在 `action_instances/*.json`，不引入数据库、消息队列或新依赖。
+
+设计原则：
+
+- **实例文件是唯一持久状态**，`/current` 只是执行中实例的实时补充。
+- **web 请求不执行 command**（Phase 2 起），创建实例即返回。
+- **actor 保持单线程、单实例执行**，不新增并发模型。
+- **能不改 actor 就不改**：Phase 1 零改动；Phase 2 只做一行 `kind` 透传。
+
+## 2. 范围
+
+### 2.1 包含
+
+1. 执行状态区：排队中、执行中、最近完成实例的列表、进度与失败原因。
+2. `action.port` 指向的 actor `GET /current` 客户端查询与降级。
+3. 实例视图字段：状态文案/样式、步骤进度、本地时间、失败摘要。
+4. 立即执行改为创建实例（`scheduled_at = now`、`kind = "immediate"`）。
+5. 单实例结果轮询端点，终态后停止轮询。
+6. 删除 `action/service.py` 的同步执行函数与旧的 pending 列表函数。
+7. 测试与验收标准。
+
+### 2.2 不包含
+
+- 不修改 `actions.json` 的 schema，不引入 vars / `${}` / object 参数。
+- 不修改 `daemon/actor.py` 的执行语义（除 Phase 2 的 `kind` 一行）。
+- 不新增数据库模型、队列、WebSocket、SSE。
+- 不做历史分页、筛选、搜索；只保留最近完成的固定条数。
+- 不支持取消执行中的实例（沿用现状：只有 pending 可取消）。
+- 不实现 `lidar-refresh` 的跨模块自动刷新（见第 7 节）。
+
+## 3. 总体架构
+
+```text
+Phase 1
+  GET /action/                 首屏：action 卡片 + 执行状态表
+  GET /action/instances        状态表片段（有进行中实例时每 2s 自刷新）
+        │
+        ├── 读 action_instances/*.json：pending / running / 最近完成
+        └── GET http://127.0.0.1:{action.port}/current
+              └── 只用于当前执行中实例的 next_index / not_before / run
+
+Phase 2
+  POST /action/<id>/run        校验 + 创建实例（scheduled_at = now）后立即返回
+        │
+        ▼
+  actor 每 tick 选中到点实例 → 逐步执行（原逻辑）
+        │
+  GET /action/instances/<id>/result   结果区每 1s 轮询，终态后不再带轮询属性
+```
+
+职责边界：
+
+| 组件 | 负责 | 不负责 |
+| --- | --- | --- |
+| action web | 创建实例、合并文件与 `/current`、渲染与轮询 | 不执行 command（Phase 2 起） |
+| action service | 模板校验、实例读写、视图字段、`/current` 客户端 | 不调度、不推进步骤 |
+| actor | 到点选择、推进步骤、终态落盘、`/current` 快照 | 不渲染页面、不关心展示字段 |
+| instance 文件 | 排队、运行中占位、终态结果 | 不提供运行中步骤进度（Phase 1） |
+
+## 4. 数据契约
+
+### 4.1 实例文件
+
+沿用现有字段，新增一个字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `kind` | string | **新增**，`"immediate"` / `"scheduled"`；旧文件缺失时按 `"scheduled"` 处理 |
+| `status` | string | `pending` / `running` / `succeeded` / `failed` / `expired` / `superseded` / `cancelled` |
+| `scheduled_at` | string | UTC ISO 8601，立即执行为创建时刻 |
+| `created_at` / `started_at` / `finished_at` | string/null | UTC ISO 8601 |
+| `steps` | array | 已解析的步骤快照（含表单覆盖） |
+| `run` | object/null | 执行结果；**actor 只在 `_finish` 时写入**，运行中为 `null` |
+| `error` | object/null | 实例级错误（expired / superseded / actor_restarted / cancelled） |
+
+不新增 `wait_until`：执行中的等待时间以 `/current.not_before` 为准，避免 actor 额外落盘。
+
+### 4.2 actor `/current`
+
+`GET http://127.0.0.1:{action.port}/current`，与 [daemon/actor.py](../../daemon/actor.py) 的 `snapshot()` 一致：
+
+空闲：
+
+```json
+{"running": false}
+```
+
+执行中：
+
+```json
+{
+  "running": true,
+  "instance_id": "record_600rpm-20261122101400000000",
+  "action_id": "record_600rpm",
+  "status": "running",
+  "next_index": 2,
+  "total_steps": 4,
+  "not_before": "2026-11-22T10:15:05+00:00",
+  "run": {
+    "run_id": "record_600rpm-20261122T101400123456Z",
+    "status": "failed",
+    "started_at": "2026-11-22T10:14:00.123456+00:00",
+    "finished_at": null,
+    "steps": [
+      {"index": 0, "command": "lidar.standby", "args": {"mode": 0},
+       "status": "succeeded", "result": {}, "error": null, "duration_ms": 54}
+    ],
+    "error": null
+  }
+}
+```
+
+字段约定：
+
+- `next_index` 是已完成步数，与页面进度 `done_steps` 一致。
+- `not_before` 是 delay 等待结束时刻；`not_before > now` 时页面显示「等待至 …」。
+- `run.steps` 只含已完成步骤，`run.status` 在运行中不可信，不用于页面判定。
+- `/current` 只覆盖当前一个实例；actor 单线程，这已足够。
+
+### 4.3 合并规则
+
+`list_instances()` 同时读取实例文件与 `/current`，按 `instance_id` 合并：
+
+1. 文件状态为终态（`succeeded` / `failed` / `expired` / `superseded` / `cancelled`）→ **一律以文件为准**，忽略 `live`。
+2. 文件状态为 `running` 且 `live.running == true` 且 `live.instance_id == instance.instance_id` → 用 `live.next_index` / `live.total_steps` / `live.not_before` / `live.run`。
+3. 文件状态为 `running` 但 `/current` 不可达、空闲或实例不匹配 → 显示 `0 / total_steps`，进度标注「不可用」，不报错。
+4. `pending` 不使用 `live`。
+5. `/current` 的读取失败不得影响列表：整体降级为规则 3。
+
+### 4.4 状态映射
+
+| status | 文案 | 样式类 | 是否终态 |
+| --- | --- | --- | --- |
+| `pending` | 等待执行 | `status-offline` | 否 |
+| `running` | 执行中 | `status-running` | 否 |
+| `succeeded` | 成功 | `status-ok` | 是 |
+| `failed` | 失败 | `status-abnormal` | 是 |
+| `expired` | 已过期 | `status-abnormal` | 是 |
+| `superseded` | 被覆盖 | `status-abnormal` | 是 |
+| `cancelled` | 已取消 | `status-offline` | 是 |
+
+`status-running` 为新增样式类，颜色使用现有 `--quota`；未知状态原样显示文案，样式按 `status-offline`。
+
+## 5. Phase 1：web 看到预约执行
+
+### 5.1 `action/service.py`
+
+新增，不改现有执行与实例写入逻辑：
+
+```python
+def current_snapshot() -> dict[str, Any] | None:
+    """读取 actor /current；任何异常或超时返回 None。"""
+
+def instance_view(instance: dict[str, Any],
+                  live: dict[str, Any] | None = None) -> dict[str, Any]:
+    """模板视图，字段见 5.1.1。"""
+
+def list_instances(limit: int = INSTANCE_HISTORY_LIMIT
+                   ) -> list[dict[str, Any]]:
+    """进行中实例 + 最近完成实例，合并 /current 后返回。"""
+```
+
+`current_snapshot()` 约束：
+
+- 端口来自 `load_action_config()['http_port']`；`ActionConfigError` → `None`。
+- URL 固定 `http://127.0.0.1:{port}/current`，超时 0.5 秒。
+- 用标准库 `urllib.request.urlopen`；捕获 `OSError`（含 `URLError` / 超时）与 `ValueError`（含 JSON 解码）。
+- 返回必须是 `dict`，否则按 `None` 处理。
+
+`list_instances()` 约束：
+
+- 通过 `iter_instances()` 读取全部实例；坏文件继续跳过（现有行为）。
+- `pending` 超过 `expire_after_seconds` 未执行的实例不展示（与 `list_pending_instances` 一致，过期由 actor 标记）。
+- 排序：进行中按 `scheduled_at` 升序（先到先执行），完成按 `created_at` 降序；完成项最多 `INSTANCE_HISTORY_LIMIT = 20` 条。
+- 一次性调用 `current_snapshot()`，按 `instance_id` 匹配，不逐实例发请求。
+
+#### 5.1.1 `instance_view` 字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `status_label` / `status_class` | 4.4 的映射 |
+| `terminal` | 是否终态 |
+| `done_steps` / `total_steps` | 进度；running 时优先取 `live.next_index` |
+| `pending_command` | running 且未完成时为下一步 command，否则 `None` |
+| `waiting` / `wait_until_local` | running 且 `live.not_before > now` 时为真，并给 UTC+8 文案 |
+| `scheduled_local` / `created_local` / `started_local` / `finished_local` | UTC+8 展示；解析失败为 `None` |
+| `run` | 终态取文件 `run`，running 取 `live.run`，否则 `{}` |
+| `failure_text` | 实例 `error` → 失败步骤 `error` → `run.error`，取第一个可用项 |
+
+### 5.2 URL 与视图
+
+| 方法 | 路径 | 行为 |
+| --- | --- | --- |
+| GET | `/action/` | 首屏：cards + 状态表 |
+| GET | `/action/instances` | 状态表片段 |
+| POST | `/action/instances/<instance_id>/cancel` | 取消 pending，返回状态表片段 |
+| POST | `/action/<action_id>/run` | Phase 1 保持现状（同步执行） |
+| POST | `/action/<action_id>/schedule` | 保持现状，触发事件改为 `instances-refresh` |
+
+- 删除 `GET /action/pending` 及 `list_pending_instances` 的视图依赖，由 `/action/instances` 取代。
+- `index` 上下文增加 `instances` 与 `has_active`（`any(not item['terminal'])`）。
+- `instances` 视图每次渲染都重新读取文件与 `/current`，不缓存。
+- `cancel` 仅对 `status == "pending"` 生效（沿用 `cancel_instance`）。
+
+### 5.3 模板与刷新
+
+`action/templates/action/index.html`：
+
+- 「预约队列」卡改为「执行状态」，外壳 `#instances-body` 监听 `instances-refresh from:body`（不直接轮询）。
+
+`action/templates/action/_instances.html`（新建，替换 `_pending.html`）：
+
+- 根元素在 `has_active` 时带 `hx-get="/action/instances"`、`hx-trigger="every 2s"`、`hx-swap="outerHTML"`；无进行中实例时不带轮询属性，页面静默。
+- 表头：动作 / 状态 / 时间 / 进度 / 详情 / 操作。
+- 时间列：pending 显示「计划 …」，running 显示「开始 …」，完成显示开始或创建时间。
+- 进度列：`done/total`；running 追加下一步 command 或「等待至 …」；`/current` 不可用时显示 `—`。
+- 详情列：`failure_text`，空则不显示。
+- 操作列：仅 pending 显示「取消」按钮，`hx-post` 到 cancel，`hx-target="#instances-body"`、`hx-swap="innerHTML"`。
+- 不新增 JS；所有值由模板默认转义。
+
+`static/base.css` 新增两行：
+
+```css
+.status-inline { font-weight: 600; white-space: nowrap; }
+.status-running { color: var(--quota); }
+```
+
+### 5.4 降级
+
+- actor 未启动：`/current` 返回 `None`，状态表仍显示 pending 与历史；running 行进度显示 `—`。
+- `action.port` 配置缺失：`current_snapshot()` 返回 `None`，不抛 `ActionConfigError` 到视图。
+- 单次 `/current` 响应慢：0.5 秒超时，状态表最多延迟一次刷新。
+- 实例文件损坏：沿用 `iter_instances` 的跳过策略。
+
+## 6. Phase 2：立即执行统一走实例 + actor
+
+### 6.1 提交立即执行
+
+`action/service.py` 新增并复用：
+
+```python
+def _find_action(action_id) -> tuple[dict | None, str | None]
+def _prepare_steps(action, overrides) -> tuple[list | None, str | None]
+def _create_instance(action, steps, scheduled_at, kind) -> dict
+def submit_action(action_id, overrides=None) -> tuple[dict | None, str | None]
+```
+
+- `submit_action`：校验模板与参数，创建 `scheduled_at = now`、`kind = "immediate"` 的实例并落盘，返回实例。
+- `schedule_action` 改用 `_find_action` / `_prepare_steps` / `_create_instance`，返回结构与现在一致（含 `scheduled_local`）。
+- `_create_instance` 统一写入 `kind`、`wait_until` 不写、`run = None`、`status = "pending"`。
+- 实例 ID 规则不变：`{action_id}-{UTC 微秒时间戳}`。
+
+### 6.2 结果轮询
+
+| 方法 | 路径 | 行为 |
+| --- | --- | --- |
+| POST | `/action/<action_id>/run` | 创建立即执行实例，返回结果片段 |
+| GET | `/action/instances/<instance_id>/result` | 返回单实例结果片段 |
+
+`_instance_result.html`：
+
+- 根元素在非终态时带 `hx-get="/action/instances/<id>/result"`、`hx-trigger="every 1s"`、`hx-swap="outerHTML"`；终态时不带，轮询自然停止。
+- 展示：状态、`run_id`、进度、失败原因、已完成步骤（command / status / duration_ms / error / result）。
+- 实例不存在：HTTP 200，显示「实例不存在」，不带轮询属性，避免 htmx 因 404 不替换导致旧内容残留。
+
+`views.run`：
+
+- 调用 `submit_action`；成功时返回结果片段并触发 `instances-refresh`，让状态表立刻出现新行。
+- 失败时返回错误片段（无轮询）。
+- **不发送 `lidar-refresh`**（见第 7 节）。
+
+### 6.3 actor 一行改动
+
+`daemon/actor.py` 的 `_advance` 中，执行身份改为读取实例：
+
+```python
+execution = {
+    'kind': instance.get('kind', 'scheduled'),
+    ...
+}
+```
+
+理由：`_build_step_context` 会把 `kind` 写进 recorder sidecar 的 `action.kind`；不读实例会导致立即执行被记成 scheduled。旧实例无 `kind`，默认 `scheduled`。
+
+### 6.4 删除清单
+
+`action/service.py` 删除：
+
+- `execute_action`
+- `execute_steps`
+- `_run_steps`
+- `_failure_run`
+- `_finish_run`
+- `list_pending_instances`
+
+保留：`execute_step`、`new_run`、`_build_step_context`、`_resolve_steps`、`_apply_overrides`、实例读写与调度辅助函数。
+
+### 6.5 已接受的语义
+
+1. **actor 不在线**：立即执行实例停在 `pending`，直到 `expire_after_seconds`（默认 600 秒）过期并标记 `expired`，不会在 web 进程内执行。
+2. **同 tick 多个到点**：只执行创建时间最新的实例，其余标记 `superseded`（现状逻辑不变）。连续点击多个「执行」时可能出现「被覆盖」，接受该行为。
+3. 不引入 FIFO 队列；需要排队时再单独设计。
+
+## 7. 延后项：`lidar-refresh`
+
+现状：同步执行时 `views.run` 在成功后返回 `HX-Trigger: lidar-refresh`。Phase 2 移除同步执行后，该刷新会自然消失。
+
+**本轮不实现替代方案**，原因：若在结果轮询端点补发 `lidar-refresh`，会把 action 与 lidar 的 UI 耦合散落在 `action/views.py`，职责不清。
+
+候选方案（后续单独评估）：
+
+| 方案 | 说明 |
+| --- | --- |
+| lidar 卡片自轮询 | lidar 卡片按固定间隔刷新自身，action 不再发事件 |
+| 统一事件层 | 由实例终态变化统一通知各卡片，action 不直接引用 lidar |
+| 保持手动刷新 | 接受 lidar 卡片只在用户点击「刷新」时更新 |
+
+Phase 2 验收不包含 `lidar-refresh`；文档与页面不承诺自动刷新。
+
+## 8. 预期文件变更
+
+| 文件 | Phase | 变更 |
+| --- | --- | --- |
+| `action/service.py` | 1 | 新增 `current_snapshot` / `instance_view` / `list_instances` / 状态常量 |
+| `action/views.py` | 1 | `index` 增加实例上下文；新增 `instances`；`cancel` 返回实例片段 |
+| `action/urls.py` | 1 | 用 `instances` 替换 `pending` 路由 |
+| `action/templates/action/index.html` | 1 | 预约队列卡改为执行状态卡 |
+| `action/templates/action/_instances.html` | 1 | 新建，替换 `_pending.html` |
+| `action/templates/action/_pending.html` | 1 | 删除 |
+| `static/base.css` | 1 | 新增 `.status-inline` / `.status-running` |
+| `action/service.py` | 2 | 新增 `submit_action` 与实例创建辅助；删除 6.4 清单 |
+| `action/views.py` | 2 | `run` 改为创建实例；新增 `instance_result` |
+| `action/urls.py` | 2 | 新增结果轮询路由 |
+| `action/templates/action/_instance_result.html` | 2 | 新建，单实例结果与轮询 |
+| `daemon/actor.py` | 2 | `_advance` 读取实例 `kind` |
+| `specs/action/action_spec.md` | — | 本文件 |
+
+不改：`actions.json` 的 schema、`device_config.json`、`lidar/*`、`recorder/*`、`artifact/*` 的接口与模板。
+
+## 9. 测试要求
+
+全部使用临时实例目录、mock HTTP / fake handler，不依赖真机与真实 actor 进程。
+
+### 9.1 Phase 1
+
+1. `/current` 正常返回 running → 对应实例显示 `next_index / total_steps` 与 `not_before` 等待文案。
+2. `/current` 超时、连接失败、JSON 非法、`action.port` 非法 → `current_snapshot()` 返回 `None`，页面不抛异常。
+3. `/current` 指向的实例与文件不匹配 → 使用文件状态，进度显示 `—`。
+4. 文件已终态但 `/current` 仍报 running → 以文件终态为准。
+5. `list_instances`：pending 未过期的展示、过期的隐藏；完成项按 `created_at` 降序且不超过 20 条。
+6. `GET /action/instances` 可独立渲染；有进行中实例时片段带轮询属性，无则不带。
+7. `cancel` 只对 pending 生效，返回更新后的状态表片段。
+8. 模板输出经过转义；不出现新增 JS。
+
+### 9.2 Phase 2
+
+1. `submit_action` 创建 `kind == "immediate"`、`scheduled_at == created_at` 的 pending 实例。
+2. `action` 不存在、`actions.json` 非法、参数越界 → 返回错误且不产生实例文件。
+3. `POST /run` 返回带轮询属性的结果片段；`GET /result` 在非终态保留轮询、终态移除轮询。
+4. `/result` 对不存在实例返回 200 与错误文案，不返回 404。
+5. `execute_action` / `execute_steps` / `_run_steps` 不再被引用（导入检查或调用检查）。
+6. actor `_advance` 传给 `execute_step` 的 `execution.kind` 等于实例 `kind`；旧实例缺失时为 `scheduled`。
+7. 立即执行成功后实例文件含完整 `run`，页面刷新后仍可在完成列表看到。
+
+## 10. 验收标准
+
+1. 预约一条含 `delay` 的多步 action，不修改 actor，页面能看到 pending → running 逐步推进（进度、下一步、等待时刻）→ 成功/失败。
+2. 停掉 actor：状态表仍显示历史；running 行进度降级为 `—`，页面无 500。
+3. Phase 2 后点击「执行」：请求立即返回，结果区显示等待中 → 执行中 → 终态；刷新页面后状态表仍能看到该实例与结果。
+4. 立即执行实例 `kind = "immediate"`，`scheduled_at` 与 `created_at` 一致。
+5. 删除清单中的函数不再存在，`views.py` 不再直接执行 command。
+6. 已接受语义：actor 不在线时立即执行停在 pending 至过期；同 tick 多实例只跑最新、其余 superseded。
+7. 本轮不产生 `lidar-refresh` 自动刷新；lidar 卡片行为与第 7 节一致。
+
+## 11. 已知限制与后续
+
+- `/current` 只覆盖当前实例；actor 单线程，无法同时展示多个执行中实例。
+- 每个打开的状态页每 2 秒产生一次本机 `/current` 请求；当前规模可忽略。
+- 立即执行依赖 actor 在线；离线时最长等待 `expire_after_seconds` 才可见过期。
+- `superseded` 是现有调度语义的直接结果，立即执行沿用，不做排队。
+- 正在执行的实例不可取消；只支持取消 pending。
+- 完成历史固定保留 20 条，不做分页与归档。
+- `lidar-refresh` 的替代方案延后，见第 7 节。
