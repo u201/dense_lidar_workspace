@@ -40,7 +40,8 @@ def instances_live(request: HttpRequest) -> HttpResponse:
 
 def _result_context(instance: dict | None, error: str | None) -> dict:
     live = (service.current_snapshot()
-            if instance and instance.get('status') == 'running' else None)
+            if instance and instance.get('status') in ('running', 'cancelling')
+            else None)
     return {
         'instance': service.instance_view(instance, live) if instance else None,
         'error': error,
@@ -91,5 +92,13 @@ def schedule(request: HttpRequest, action_id: str) -> HttpResponse:
 def cancel(request: HttpRequest, instance_id: str) -> HttpResponse:
     """POST /action/instances/<id>/cancel —— 取消尚未执行的预约。"""
     error = service.cancel_instance(instance_id)
+    return render(request, 'action/_instances_live.html',
+                  _instances_context(error))
+
+
+@require_http_methods(['POST'])
+def abort(request: HttpRequest, instance_id: str) -> HttpResponse:
+    """POST /action/instances/<id>/abort —— 中止执行中的实例。"""
+    error = service.request_abort(instance_id)
     return render(request, 'action/_instances_live.html',
                   _instances_context(error))
