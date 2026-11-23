@@ -54,6 +54,20 @@
                   {% csrf_token %}
                   <button class="op danger" type="submit">取消</button>
                 </form>
+              {% elif instance.status == 'running' %}
+                <form class="inline"
+                      hx-post="{% url 'action:abort' instance.instance_id %}"
+                      hx-target="#instances-live"
+                      hx-swap="outerHTML"
+                      hx-disabled-elt="find button"
+                      hx-confirm="中止执行 {{ instance.title }}？">
+                  {% csrf_token %}
+                  <button class="op danger" type="submit">中止</button>
+                </form>
+              {% elif instance.status == 'cancelling' %}
+                <button class="op" type="button" disabled>中止中</button>
+              {% elif instance.status == 'aborted' %}
+                <span class="mtime">已中止</span>
               {% endif %}
             </td>
           </tr>
