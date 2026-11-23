@@ -9,6 +9,7 @@ app_name = 'action'
 urlpatterns = [
     path('', views.index, name='index'),
     path('instances', views.instances, name='instances'),
+    path('instances/live', views.instances_live, name='instances_live'),
     path('instances/<str:instance_id>/result',
          views.instance_result, name='instance_result'),
     path('instances/<str:instance_id>/cancel', views.cancel, name='cancel'),
