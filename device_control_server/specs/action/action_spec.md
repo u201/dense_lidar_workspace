@@ -6,14 +6,15 @@
 
 1. **Phase 1**：web 新增执行状态区，能看到预约排队、执行中进度、最近完成结果。**不修改 `daemon/actor.py`**，执行中进度来自 actor 的 `GET /current`，其余状态来自实例文件。
 2. **Phase 2**：`POST /action/<id>/run` 不再在请求线程里同步执行，而是创建 `scheduled_at = now` 的实例，由 actor 执行；同时删除 `action/service.py` 里的同步执行代码。
-3. 保持现有文件契约：实例仍落在 `action_instances/*.json`，不引入数据库、消息队列或新依赖。
+3. **Phase 3**：`actions.json` 在 `steps` 同级新增可选 `cleanup` 组（成功 / 失败 / 中止都执行），action 支持执行中中止，recorder 支持单次录制中止。
+4. 保持现有文件契约：实例仍落在 `action_instances/*.json`，不引入数据库、消息队列或新依赖。
 
 设计原则：
 
 - **实例文件是唯一持久状态**，`/current` 只是执行中实例的实时补充。
 - **web 请求不执行 command**（Phase 2 起），创建实例即返回。
 - **actor 保持单线程、单实例执行**，不新增并发模型。
-- **能不改 actor 就不改**：Phase 1 零改动；Phase 2 只做一行 `kind` 透传。
+- **能不改 actor 就不改**：Phase 1 零改动；Phase 2 只做一行 `kind` 透传；Phase 3 为支持中止必须扩展 actor 状态机与 HTTP 接口。
 
 ## 2. 范围
 
@@ -26,15 +27,16 @@
 5. 单实例结果轮询端点，终态后停止轮询。
 6. 删除 `action/service.py` 的同步执行函数与旧的 pending 列表函数。
 7. 测试与验收标准。
+8. `cleanup` 组（finally 语义）与执行中实例中止（Phase 3）。
 
 ### 2.2 不包含
 
-- 不修改 `actions.json` 的 schema，不引入 vars / `${}` / object 参数。
+- 不引入 vars / `${}` / object 参数；Phase 3 在 `steps` 同级新增可选的 `cleanup` 组。
 - 不修改 `daemon/actor.py` 的执行语义（除 Phase 2 的 `kind` 一行）。
 - 不新增数据库模型、队列、WebSocket、SSE。
 - 不做历史分页、筛选、搜索；只保留最近完成的固定条数。
-- 不支持取消执行中的实例（沿用现状：只有 pending 可取消）。
-- 不实现 `lidar-refresh` 的跨模块自动刷新（见第 7 节）。
+- 支持 pending 取消与 running 中止（Phase 3，见第 7 节）。
+- 不实现 `lidar-refresh` 的跨模块自动刷新（见第 8 节）。
 
 ## 3. 总体架构
 
@@ -74,11 +76,12 @@ Phase 2
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `kind` | string | **新增**，`"immediate"` / `"scheduled"`；旧文件缺失时按 `"scheduled"` 处理 |
-| `status` | string | `pending` / `running` / `succeeded` / `failed` / `expired` / `superseded` / `cancelled` |
+| `status` | string | `pending` / `running` / `cancelling` / `succeeded` / `failed` / `expired` / `superseded` / `cancelled` / `aborted` |
 | `scheduled_at` | string | UTC ISO 8601，立即执行为创建时刻 |
 | `created_at` / `started_at` / `finished_at` | string/null | UTC ISO 8601 |
 | `steps` | array | 已解析的步骤快照（含表单覆盖） |
-| `run` | object/null | 执行结果；**actor 只在 `_finish` 时写入**，运行中为 `null` |
+| `cleanup` | array | **新增（Phase 3）**，已解析的 cleanup 步骤快照；旧文件缺失时按空数组处理 |
+| `run` | object/null | 执行结果；**actor 只在 `_finish` 时写入**，运行中为 `null`；终态时含 `steps` 与 `cleanup` 两个结果数组 |
 | `error` | object/null | 实例级错误（expired / superseded / actor_restarted / cancelled） |
 
 不新增 `wait_until`：执行中的等待时间以 `/current.not_before` 为准，避免 actor 额外落盘。
@@ -124,6 +127,7 @@ Phase 2
 - `not_before` 是 delay 等待结束时刻；`not_before > now` 时页面显示「等待至 …」。
 - `run.steps` 只含已完成步骤，`run.status` 在运行中不可信，不用于页面判定。
 - `/current` 只覆盖当前一个实例；actor 单线程，这已足够。
+- **Phase 3 新增字段**：`phase`（`"steps"` / `"cleanup"`）、`cancel_requested`（bool）、`cleanup_total`、`cleanup_done`；actor 不支持时这些字段可缺失，页面按 steps 阶段降级。
 
 ### 4.3 合并规则
 
@@ -146,6 +150,8 @@ Phase 2
 | `expired` | 已过期 | `status-abnormal` | 是 |
 | `superseded` | 被覆盖 | `status-abnormal` | 是 |
 | `cancelled` | 已取消 | `status-offline` | 是 |
+| `cancelling` | 中止中 | `status-running` | 否 |
+| `aborted` | 已中止 | `status-abnormal` | 是 |
 
 `status-running` 为新增样式类，颜色使用现有 `--quota`；未知状态原样显示文案，样式按 `status-offline`。
 
@@ -275,7 +281,7 @@ def submit_action(action_id, overrides=None) -> tuple[dict | None, str | None]
 
 - 调用 `submit_action`；成功时返回结果片段并触发 `instances-refresh`，让状态表立刻出现新行。
 - 失败时返回错误片段（无轮询）。
-- **不发送 `lidar-refresh`**（见第 7 节）。
+- **不发送 `lidar-refresh`**（见第 8 节）。
 
 ### 6.3 actor 一行改动
 
@@ -309,7 +315,117 @@ execution = {
 2. **同 tick 多个到点**：只执行创建时间最新的实例，其余标记 `superseded`（现状逻辑不变）。连续点击多个「执行」时可能出现「被覆盖」，接受该行为。
 3. 不引入 FIFO 队列；需要排队时再单独设计。
 
-## 7. 延后项：`lidar-refresh`
+## 7. Phase 3：cleanup 与中止
+
+让「执行中 action 可被中止」落地，并提供类似 try/finally 的 cleanup 组：正常路径失败或被中止后，仍顺次执行一组收尾指令（含 recorder 中止等），保证设备回到安全态。
+
+### 7.1 `actions.json` 增加 `cleanup`
+
+`cleanup` 与 `steps` 同级，可选，元素结构与 `steps` 完全一致（`command` / `args` / `delay`）：
+
+```json
+{
+  "action_id": "record_10s_and_standby",
+  "title": "录制 10 秒并回到待机",
+  "steps": [
+    {"command": "lidar.standby", "args": {"mode": 0}},
+    {"command": "recorder.record", "args": {"duration": 10}}
+  ],
+  "cleanup": [
+    {"command": "recorder.abort", "args": {}},
+    {"command": "lidar.standby", "args": {"mode": 1}}
+  ]
+}
+```
+
+解析与实例化：
+
+- `_normalize_action()` 复用 `_normalize_step()` 校验 `cleanup`，错误合并进 `errors`；`cleanup` 缺失按空数组处理。
+- `cleanup` 不接受表单覆盖，只用定义值（避免用户在 web 上误关掉机安全指令）。
+- `_create_instance()` 把已解析的 `cleanup` 快照写入实例文件，与 `steps` 同级；旧实例缺失 `cleanup` 时按空数组处理。
+- 仍不引入 vars / `${}` / object 参数。
+
+### 7.2 actor 状态机扩展
+
+实例 `status` 新增两个值：`cancelling`（中止中，非终态）、`aborted`（已中止，终态）。
+
+actor 执行分两个阶段：
+
+1. **steps 阶段**：逐条执行 `steps`，与现状一致；某条失败即停止后续 steps。
+2. **cleanup 阶段**：steps 全部成功、steps 失败、或收到中止后进入；逐条执行 `cleanup`，单条失败只记录、不阻断后续 cleanup。
+
+`/current` 快照新增字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `phase` | `"steps"` / `"cleanup"` |
+| `cancel_requested` | bool，是否已收到中止 |
+| `cleanup_total` | cleanup 总条数 |
+| `cleanup_done` | 已完成 cleanup 条数 |
+
+`run` 结果增加 `cleanup` 数组，结构与 `run.steps` 一致（`index` / `command` / `args` / `status` / `result` / `error` / `duration_ms`），与 `steps` 分开存放，不污染 `steps` 的索引。
+
+终态规则：
+
+| steps 结果 | cleanup 结果 | 收到中止 | 最终 status |
+| --- | --- | --- | --- |
+| 全成功 | 全成功 | 否 | `succeeded` |
+| 全成功 | 有失败 | 否 | `failed`，`error.code = "cleanup_failed"`，cleanup 错误记入 `run` |
+| 失败 | 已执行 | 否 | `failed`，保留 steps 原始错误，cleanup 错误附加在 `run` |
+| 任意 | 已执行 | 是 | `aborted`；cleanup 仍执行完，cleanup 错误附加在 `run`，不覆盖中止结论 |
+|}
+### 7.3 中止入口：`POST /current/abort`
+
+actor 新增本地 HTTP 端点（仅回环）：
+
+```
+POST http://127.0.0.1:{action.port}/current/abort
+{"instance_id": "<当前实例 ID>"}
+```
+
+行为：
+
+1. 校验 `current` 非空且 `current.instance_id == 请求 instance_id`；不匹配 → `409`，`{ok: false, error: {...}}`。
+2. 设置 `current.cancel_requested = true`，把实例文件 `status` 写为 `cancelling`。
+3. **立即**调用注册表里的 `recorder.abort`（见 recorder_spec 5.8），打断阻塞中的 `recorder.record`。这是必须的快路径：actor 主循环卡在阻塞步骤里，只有 HTTP 线程能打断它。
+4. 返回 `202 {ok: true}`，不等待 cleanup 完成。
+5. 后续 tick：阻塞步骤返回后，跳过剩余 steps，进入 cleanup；cleanup 完成后落盘 `aborted`。
+
+并发安全：`current` 与实例落盘由同一把锁保护；**不在 command handler 执行期间持锁**，避免 HTTP 线程死锁。对不支持中止的 command，只能协作式取消（标记 `cancel_requested`，等当前 handler 返回后跳过剩余 steps），不承诺所有命令都能立即终止。
+
+`action/service.py` 新增 `request_abort(instance_id)`：
+
+- `pending` → 复用 `cancel_instance()`。
+- `running` / `cancelling` → 转发 actor `POST /current/abort`，返回错误文案或 `None`。
+- 终态 → 返回「实例已结束，无法中止」。
+
+### 7.4 Web 中止按钮
+
+复用现有 action 执行状态卡（Phase 1 已建），不新建 app：
+
+| 方法 | 路径 | 行为 |
+| --- | --- | --- |
+| POST | `/action/instances/<instance_id>/abort` | 中止 running / cancelling 实例，返回状态表片段 |
+
+模板行为：
+
+- `pending`：显示「取消」（沿用现状）。
+- `running`：显示「中止」按钮，`hx-post` 到 abort，`hx-target="#instances-body"`、`hx-swap="innerHTML"`。
+- `cancelling`：显示「中止中」，按钮禁用，不重复发请求。
+- `aborted`：显示「已中止」。
+- 单实例结果页（`_instance_result.html`）同样提供中止入口。
+
+recorder web 卡片继续只读，不在 recorder 页面提供中止按钮；中止统一在 action 页发起。
+
+### 7.5 已接受语义与限制
+
+1. **进程存活期间** cleanup 保证执行一次；actor 崩溃或断电不保证 cleanup 执行，遗留 `running` / `cancelling` 实例由重启恢复标记为 `failed`（`actor_restarted`）。
+2. 中止是幂等的：对 `cancelling` 重复发 abort 返回成功但不重复动作。
+3. `recorder.abort` 按 `record_id` / `run_id` 限定，空闲时为 no-op，不误停其他 action 新开始的录制。
+4. `cancelling` 可能持续到当前阻塞步骤返回；UI 以「中止中」呈现，不提前显示「已中止」。
+5. 对无中止能力的 command，中止只保证跳过后续 steps，当前步骤会跑到自然返回。
+
+## 8. 延后项：`lidar-refresh`
 
 现状：同步执行时 `views.run` 在成功后返回 `HX-Trigger: lidar-refresh`。Phase 2 移除同步执行后，该刷新会自然消失。
 
@@ -325,7 +441,7 @@ execution = {
 
 Phase 2 验收不包含 `lidar-refresh`；文档与页面不承诺自动刷新。
 
-## 8. 预期文件变更
+## 9. 预期文件变更
 
 | 文件 | Phase | 变更 |
 | --- | --- | --- |
@@ -341,15 +457,23 @@ Phase 2 验收不包含 `lidar-refresh`；文档与页面不承诺自动刷新�
 | `action/urls.py` | 2 | 新增结果轮询路由 |
 | `action/templates/action/_instance_result.html` | 2 | 新建，单实例结果与轮询 |
 | `daemon/actor.py` | 2 | `_advance` 读取实例 `kind` |
+| `action/service.py` | 3 | `_normalize_action` 解析 `cleanup`；`_create_instance` 写入 cleanup 快照；新增 `request_abort`；状态常量加 `cancelling` / `aborted` |
+| `daemon/actor.py` | 3 | 状态机加 cleanup 阶段与 `cancel_requested`；新增 `POST /current/abort`；`snapshot` 增加 phase / cleanup 字段 |
+| `action/views.py` | 3 | 新增 `abort` 视图 |
+| `action/urls.py` | 3 | 新增 abort 路由 |
+| `action/templates/action/_instances_live.html` | 3 | `running` 显示中止按钮、`cancelling` 显示中止中 |
+| `action/templates/action/_instance_result.html` | 3 | 中止入口 |
+| `actions.json` | 3 | 示例 action 增加 `cleanup` 组 |
+| `recorder/*` | 3 | 见 recorder_spec 5.8（`/abort` 与 `recorder.abort` command） |
 | `specs/action/action_spec.md` | — | 本文件 |
 
-不改：`actions.json` 的 schema、`device_config.json`、`lidar/*`、`recorder/*`、`artifact/*` 的接口与模板。
+不改：`device_config.json`、`lidar/*`、`artifact/*` 的接口与模板；`actions.json` 仅新增可选 `cleanup`，`recorder/*` 仅新增 `/abort` 与 `recorder.abort`（见各自 spec）。
 
-## 9. 测试要求
+## 10. 测试要求
 
 全部使用临时实例目录、mock HTTP / fake handler，不依赖真机与真实 actor 进程。
 
-### 9.1 Phase 1
+### 10.1 Phase 1
 
 1. `/current` 正常返回 running → 对应实例显示 `next_index / total_steps` 与 `not_before` 等待文案。
 2. `/current` 超时、连接失败、JSON 非法、`action.port` 非法 → `current_snapshot()` 返回 `None`，页面不抛异常。
@@ -360,7 +484,7 @@ Phase 2 验收不包含 `lidar-refresh`；文档与页面不承诺自动刷新�
 7. `cancel` 只对 pending 生效，返回更新后的状态表片段。
 8. 模板输出经过转义；不出现新增 JS。
 
-### 9.2 Phase 2
+### 10.2 Phase 2
 
 1. `submit_action` 创建 `kind == "immediate"`、`scheduled_at == created_at` 的 pending 实例。
 2. `action` 不存在、`actions.json` 非法、参数越界 → 返回错误且不产生实例文件。
@@ -370,7 +494,18 @@ Phase 2 验收不包含 `lidar-refresh`；文档与页面不承诺自动刷新�
 6. actor `_advance` 传给 `execute_step` 的 `execution.kind` 等于实例 `kind`；旧实例缺失时为 `scheduled`。
 7. 立即执行成功后实例文件含完整 `run`，页面刷新后仍可在完成列表看到。
 
-## 10. 验收标准
+### 10.3 Phase 3
+
+1. `cleanup` 解析：缺失 → 空数组；非法 command / args → 合并进 `errors`，不创建实例。
+2. 成功路径：steps 全成功后 cleanup 仍执行一次，`run.cleanup` 完整；终态 `succeeded`。
+3. steps 失败：剩余 steps 跳过，cleanup 仍执行；cleanup 单条失败不阻断后续 cleanup；终态 `failed` 保留原始错误。
+4. 中止：`POST /current/abort` 后 `cancel_requested` 置位，跳过剩余 steps 进入 cleanup，终态 `aborted`；cleanup 错误附加在 `run`。
+5. 幂等：对 `cancelling` 重复 abort 不产生第二次 cleanup。
+6. `request_abort`：`pending` → `cancelled`；`running` / `cancelling` → 转发 actor；终态 → 返回错误文案。
+7. 中止不匹配的 `instance_id` → 409，不影响当前实例。
+8. cleanup 阶段 `execute_step` 的 `step_index` / `step_count` 取自 cleanup，不与 steps 混用。
+
+## 11. 验收标准
 
 1. 预约一条含 `delay` 的多步 action，不修改 actor，页面能看到 pending → running 逐步推进（进度、下一步、等待时刻）→ 成功/失败。
 2. 停掉 actor：状态表仍显示历史；running 行进度降级为 `—`，页面无 500。
@@ -378,14 +513,18 @@ Phase 2 验收不包含 `lidar-refresh`；文档与页面不承诺自动刷新�
 4. 立即执行实例 `kind = "immediate"`，`scheduled_at` 与 `created_at` 一致。
 5. 删除清单中的函数不再存在，`views.py` 不再直接执行 command。
 6. 已接受语义：actor 不在线时立即执行停在 pending 至过期；同 tick 多实例只跑最新、其余 superseded。
-7. 本轮不产生 `lidar-refresh` 自动刷新；lidar 卡片行为与第 7 节一致。
+7. 本轮不产生 `lidar-refresh` 自动刷新；lidar 卡片行为与第 8 节一致。
+8. 配置含 `cleanup` 的 action：成功 / 失败 / 中止三种情况下 cleanup 都执行一次，`run.cleanup` 在结果页可见。
+9. 执行中点「中止」：实例 `running → cancelling → aborted`，录制被打断（sidecar `aborted`），设备回到 cleanup 定义的安全态；重复点击不重复执行。
+10. actor 崩溃后重启：`running` / `cancelling` 实例标记为 `failed`，不假装 cleanup 已执行。
 
-## 11. 已知限制与后续
+## 12. 已知限制与后续
 
 - `/current` 只覆盖当前实例；actor 单线程，无法同时展示多个执行中实例。
 - 每个打开的状态页每 2 秒产生一次本机 `/current` 请求；当前规模可忽略。
 - 立即执行依赖 actor 在线；离线时最长等待 `expire_after_seconds` 才可见过期。
 - `superseded` 是现有调度语义的直接结果，立即执行沿用，不做排队。
-- 正在执行的实例不可取消；只支持取消 pending。
+- 正在执行的实例可中止（`aborted`），pending 可取消（`cancelled`）；不支持暂停、续跑或回滚已执行步骤。
 - 完成历史固定保留 20 条，不做分页与归档。
-- `lidar-refresh` 的替代方案延后，见第 7 节。
+- actor 崩溃或断电期间不保证 cleanup 执行；遗留 `running` / `cancelling` 实例重启后统一标记 `failed`。
+- `lidar-refresh` 的替代方案延后，见第 8 节。
