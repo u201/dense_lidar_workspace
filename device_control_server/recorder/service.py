@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import sys
 import urllib.error
@@ -58,8 +57,8 @@ def platform_interface_key() -> str:
 def load_config(config_path: Path | None = None) -> dict[str, Any]:
     """读取并校验 device_config.json 的 recorder 段。
 
-    返回 {interface, udp_port, port, device_ip, timeout, dumpcap_path}。
-    device_ip 必须是回环地址：daemon 只允许本机访问。
+    返回 {interface, udp_port, port, timeout, dumpcap_path}。
+    daemon 固定监听 127.0.0.1：只允许本机访问。
     """
     path = Path(config_path) if config_path else CONFIG_PATH
     try:
@@ -86,17 +85,6 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
     if not _is_int(port) or not 1 <= port <= 65535:
         raise RecorderConfigError('recorder.port 必须是 1-65535 的整数')
 
-    host = section.get('device_ip')
-    if not isinstance(host, str) or not host.strip():
-        raise RecorderConfigError('recorder.device_ip 缺失或非法')
-    try:
-        is_loopback = ipaddress.ip_address(host.strip()).is_loopback
-    except ValueError:
-        raise RecorderConfigError(f'recorder.device_ip 不是合法地址: {host!r}')
-    if not is_loopback:
-        raise RecorderConfigError(
-            f'recorder.device_ip 必须是回环地址: {host!r}')
-
     timeout = section.get('request_timeout_seconds', DEFAULT_TIMEOUT)
     if not _is_number(timeout) or timeout <= 0:
         raise RecorderConfigError(
@@ -110,14 +98,13 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
         'interface': interface.strip(),
         'udp_port': udp_port,
         'port': port,
-        'device_ip': host.strip(),
         'timeout': float(timeout),
         'dumpcap_path': dumpcap_path.strip() if dumpcap_path else None,
     }
 
 
 def _base_url(cfg: dict[str, Any]) -> str:
-    return f'http://{cfg["device_ip"]}:{cfg["port"]}'
+    return f'http://127.0.0.1:{cfg["port"]}'
 
 
 def _parse_body(raw: bytes) -> Any:
