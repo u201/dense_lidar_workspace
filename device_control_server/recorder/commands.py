@@ -25,6 +25,9 @@ CODE_MAP = {
     'capture_permission_denied': 'capture_unavailable',
     'capture_failed': 'capture_failed',
     'daemon_stopped': 'capture_failed',
+    'recorder_aborted': 'recorder_aborted',
+    'record_mismatch': 'record_mismatch',
+    'invalid_request': 'invalid_args',
 }
 
 # 客户端超时在录制时长之外留出的余量：预检 + 工具启动 + 收尾。
@@ -93,6 +96,28 @@ def record(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def abort(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    """中止当前录制；不读取 ctx，幂等，空闲时也返回成功。"""
+    try:
+        cfg = service.load_config()
+    except service.RecorderConfigError as exc:
+        raise CommandError('config_error', exc.message)
+
+    record_id = args.get('record_id')
+    try:
+        payload = service.abort(record_id, cfg=cfg, timeout=cfg['timeout'])
+    except service.RecorderUnreachableError as exc:
+        raise CommandError('recorder_unreachable', exc.message)
+    except service.RecorderError as exc:
+        raise CommandError(CODE_MAP.get(exc.code, 'recorder_error'),
+                           exc.message, exc.detail)
+
+    return {
+        'record_id': record_id,
+        'aborted': bool(payload.get('aborted')),
+    }
+
+
 COMMANDS = {
     'recorder.record': {
         'label': '录制雷达数据',
@@ -110,5 +135,20 @@ COMMANDS = {
             },
         ],
         'handler': record,
+        'abort': 'recorder.abort',
+    },
+    'recorder.abort': {
+        'label': '中止当前录制',
+        'description': '中止正在进行的单次录制；空闲时无操作',
+        'params': [
+            {
+                'name': 'record_id',
+                'label': '录制 ID',
+                'type': 'string',
+                'required': False,
+                'help': '可选；留空表示中止当前录制',
+            },
+        ],
+        'handler': abort,
     },
 }
