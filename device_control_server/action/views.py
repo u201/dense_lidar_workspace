@@ -30,6 +30,12 @@ def index(request: HttpRequest) -> HttpResponse:
 
 
 @require_http_methods(['GET'])
+def card(request: HttpRequest) -> HttpResponse:
+    """GET /action/frag/card —— 门户页片段：执行状态与全部 action 卡片。"""
+    return render(request, 'action/_frag.html', _index_context())
+
+
+@require_http_methods(['GET'])
 def instances(request: HttpRequest) -> HttpResponse:
     """GET /action/instances —— 执行状态片段（进行中 + 最近完成）。"""
     return render(request, 'action/_instances.html', _instances_context())
