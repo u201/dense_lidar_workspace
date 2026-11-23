@@ -27,12 +27,11 @@
 6. recorder 守护进程的本地 HTTP API（status / record / abort）。
 7. `recorder` Django app 的 URL、视图、模板、只读卡片。
 8. `recorder.record` command 的 schema、handler、错误映射。
-9. 对 action、lidar、artifact 的最小改动清单。
-10. 测试要求与验收标准。
+9. 单次录制中止：daemon `POST /abort` 与 `recorder.abort` command（见 5.8）。
 
 ### 2.2 不包含
 
-- 支持单次录制中止（`POST /abort`，见 5.8）；不支持暂停、续录。
+- 不支持暂停、续录；中止后不可恢复，也不保留可续录的中间状态。
 - 不提供 web 端手动录制入口，录制只能由 action 触发。
 - 不做多网卡、多雷达并发录制；进程内单实例。
 - 不做 pcap 解析、点云转换、上传、压缩、分片。
