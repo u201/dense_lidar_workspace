@@ -20,6 +20,23 @@
     </div>
   </section>
 
+  <section class="card" id="turntable-card">
+    <header class="card-header">
+      <h2>Turntable</h2>
+      <button class="op"
+              hx-get="{% url 'turntable:card' %}"
+              hx-target="#turntable-body"
+              hx-swap="innerHTML"
+              hx-disabled-elt="this">刷新</button>
+    </header>
+    <div id="turntable-body"
+         hx-get="{% url 'turntable:card' %}"
+         hx-trigger="load"
+         hx-swap="innerHTML">
+      <p class="empty">加载中…</p>
+    </div>
+  </section>
+
   <section class="card" id="recorder-card">
     <header class="card-header">
       <h2>Recorder</h2>
