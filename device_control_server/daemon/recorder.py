@@ -349,9 +349,8 @@ class Recorder:
     def run_forever(self) -> None:
         cfg = recorder_service.load_config()
         self._recover_stale_sidecars()
-        self._start_http(cfg['device_ip'], cfg['port'])
-        logger.info('recorder started on http://%s:%s',
-                    cfg['device_ip'], cfg['port'])
+        self._start_http('127.0.0.1', cfg['port'])
+        logger.info('recorder started on http://127.0.0.1:%s', cfg['port'])
         self._stop.wait()
         self._wait_capture_finished()
         self._stop_http()
