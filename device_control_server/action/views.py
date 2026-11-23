@@ -31,6 +31,13 @@ def instances(request: HttpRequest) -> HttpResponse:
     return render(request, 'action/_instances.html', _instances_context())
 
 
+@require_http_methods(['GET'])
+def instances_live(request: HttpRequest) -> HttpResponse:
+    """GET /action/instances/live —— 轮询片段，不替换滚动容器。"""
+    return render(request, 'action/_instances_live.html',
+                  _instances_context())
+
+
 def _result_context(instance: dict | None, error: str | None) -> dict:
     return {
         'instance': service.instance_view(instance) if instance else None,
@@ -82,5 +89,5 @@ def schedule(request: HttpRequest, action_id: str) -> HttpResponse:
 def cancel(request: HttpRequest, instance_id: str) -> HttpResponse:
     """POST /action/instances/<id>/cancel —— 取消尚未执行的预约。"""
     error = service.cancel_instance(instance_id)
-    return render(request, 'action/_instances.html',
+    return render(request, 'action/_instances_live.html',
                   _instances_context(error))
