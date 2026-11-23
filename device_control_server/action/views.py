@@ -1,4 +1,4 @@
-"""Action 视图：htmx 整页与单卡片执行结果片段。"""
+"""Action 视图：htmx 整页、执行结果片段与执行状态队列。"""
 
 from django.http import HttpRequest, HttpResponse
 from django.shortcuts import render
@@ -7,15 +7,28 @@ from django.views.decorators.http import require_http_methods
 from . import service
 
 
+def _instances_context(error: str | None = None) -> dict:
+    instances = service.list_instances()
+    return {
+        'instances': instances,
+        'has_active': any(not item['terminal'] for item in instances),
+        'error': error,
+    }
+
+
 @require_http_methods(['GET'])
 def index(request: HttpRequest) -> HttpResponse:
-    """GET /action/ —— 首屏直接渲染全部 action 卡片与预约队列。"""
+    """GET /action/ —— 首屏直接渲染全部 action 卡片与执行状态。"""
     actions, file_error = service.load_actions()
-    return render(request, 'action/index.html', {
-        'actions': actions,
-        'file_error': file_error,
-        'pending_instances': service.list_pending_instances(),
-    })
+    context = _instances_context()
+    context.update({'actions': actions, 'file_error': file_error})
+    return render(request, 'action/index.html', context)
+
+
+@require_http_methods(['GET'])
+def instances(request: HttpRequest) -> HttpResponse:
+    """GET /action/instances —— 执行状态片段（进行中 + 最近完成）。"""
+    return render(request, 'action/_instances.html', _instances_context())
 
 
 @require_http_methods(['POST'])
@@ -46,24 +59,14 @@ def schedule(request: HttpRequest, action_id: str) -> HttpResponse:
         'error': error,
     })
     if instance is not None:
-        # 预约队列卡片监听该事件，局部刷新
-        response['HX-Trigger'] = 'pending-refresh'
+        # 执行状态卡片监听该事件，局部刷新
+        response['HX-Trigger'] = 'instances-refresh'
     return response
-
-
-@require_http_methods(['GET'])
-def pending(request: HttpRequest) -> HttpResponse:
-    """GET /action/pending —— 预约队列片段。"""
-    return render(request, 'action/_pending.html', {
-        'pending_instances': service.list_pending_instances(),
-    })
 
 
 @require_http_methods(['POST'])
 def cancel(request: HttpRequest, instance_id: str) -> HttpResponse:
-    """POST /action/pending/<id>/cancel —— 取消尚未执行的预约。"""
+    """POST /action/instances/<id>/cancel —— 取消尚未执行的预约。"""
     error = service.cancel_instance(instance_id)
-    return render(request, 'action/_pending.html', {
-        'pending_instances': service.list_pending_instances(),
-        'error': error,
-    })
+    return render(request, 'action/_instances.html',
+                  _instances_context(error))
