@@ -148,7 +148,7 @@ class Actor:
         step = steps[current['next_index']]
         instance = current['instance']
         execution = {
-            'kind': 'scheduled',
+            'kind': instance.get('kind', 'scheduled'),
             'instance_id': instance['instance_id'],
             'title': instance.get('title') or instance['action_id'],
             'scheduled_at': instance.get('scheduled_at'),
