@@ -41,6 +41,7 @@ INSTALLED_APPS = [
     'lidar',
     'action',
     'recorder',
+    'turntable',
 ]
 
 MIDDLEWARE = [
