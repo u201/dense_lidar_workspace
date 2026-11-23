@@ -165,3 +165,7 @@ button.danger:active { background: #8c1d17; }
 .status-offline { color: var(--muted); }
 .status-abnormal,
 .status-config_error { color: var(--danger); }
+
+/* 执行状态表内的行内状态：不撑大行高，颜色仍由上方类决定 */
+.status-inline { font-weight: 600; white-space: nowrap; }
+.status-running { color: var(--quota); }
